@@ -1,239 +1,91 @@
-"""Scan LGE_MULTI directory and build train/val/test CSV splits.
-
-Usage:
-    python preprocessing/build_splits.py \
-        --data-root data/LGE_MULTI \
-        --output data/processed/splits
-"""
-
+"""Create reproducible patient manifests from an existing three-modality cache."""
 from __future__ import annotations
-
 import argparse
-import logging
-import re
+import json
 from pathlib import Path
+import sys
 
-from typing import Any
-
-import pandas as pd
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-logger = logging.getLogger("BuildSplits")
-
-TASK_DIR_PATTERN = re.compile(r"^(SAX|2CH|4CH|RAS)_(TR|VAL|TST)$", re.IGNORECASE)
-FILE_PATTERN = re.compile(r"^(?:LGE_)?(SAX|2CH|4CH|RAS)_(\d+)\.nii(?:\.gz)?$", re.IGNORECASE)
-SPLIT_ALIASES = {"TR": "train", "VAL": "validation", "TST": "test"}
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from preprocessing.preprocessing import MODALITIES, create_patient_splits, discover_cases
+from training.dataset.data_contract import (
+    _write_manifest, patient_id, read_split_names, validate_patient_splits,
+)
 
 
-class DataLeakageError(ValueError, RuntimeError):
-    """Raised when patient-level data leakage is detected across splits."""
-
-    pass
-
-
-def verify_split_independence(df: pd.DataFrame, strict: bool = True) -> dict[str, Any]:
-    """Verify strict patient-level split independence both within views and across all views.
-
-    Enforces 0% patient leakage between train, validation, and test splits across all views.
-
-    Args:
-        df: Manifest DataFrame with columns ['subject_id', 'split'] (and optionally 'view').
-        strict: If True, raise DataLeakageError (inherits from ValueError & RuntimeError) on any patient overlap.
-
-    Returns:
-        Dictionary summary containing 'is_independent', 'splits', 'patient_counts',
-        'split_patients', and 'leakages'.
-
-    Raises:
-        DataLeakageError: If strict=True and any patient overlap is found across splits.
-    """
-    if "subject_id" not in df.columns or "split" not in df.columns:
-        raise ValueError("DataFrame must contain 'subject_id' and 'split' columns.")
-
-    splits = sorted([s for s in df["split"].unique() if pd.notna(s)])
-    split_patients = {s: set(df[df["split"] == s]["subject_id"].astype(str)) for s in splits}
-
-    leakage_records = []
-    for i, s1 in enumerate(splits):
-        for s2 in splits[i + 1 :]:
-            overlap = split_patients[s1] & split_patients[s2]
-            if overlap:
-                for pid in sorted(overlap):
-                    if "view" in df.columns:
-                        views_s1 = sorted(
-                            df[(df["split"] == s1) & (df["subject_id"].astype(str) == pid)]["view"]
-                            .dropna()
-                            .unique()
-                            .tolist()
-                        )
-                        views_s2 = sorted(
-                            df[(df["split"] == s2) & (df["subject_id"].astype(str) == pid)]["view"]
-                            .dropna()
-                            .unique()
-                            .tolist()
-                        )
-                    else:
-                        views_s1 = ["N/A"]
-                        views_s2 = ["N/A"]
-
-                    leakage_records.append({
-                        "subject_id": pid,
-                        "split_1": s1,
-                        "views_1": views_s1,
-                        "split_2": s2,
-                        "views_2": views_s2,
-                    })
-
-    has_leakage = len(leakage_records) > 0
-    if has_leakage:
-        msg_lines = [
-            f"CRITICAL CROSS-VIEW DATA LEAKAGE: Found {len(leakage_records)} patient-level split conflicts:"
-        ]
-        for rec in leakage_records:
-            msg_lines.append(
-                f"  • Patient '{rec['subject_id']}': present in '{rec['split_1']}' (views: {rec['views_1']}) "
-                f"AND '{rec['split_2']}' (views: {rec['views_2']})"
-            )
-        full_msg = "\n".join(msg_lines)
-        if strict:
-            raise DataLeakageError(full_msg)
-        logger.error("⚠️ %s", full_msg)
-
-    # Log per-split patient counts
-    for s in splits:
-        logger.info("  ✓ Split '%s': %d unique patients", f"{s:12s}", len(split_patients[s]))
-    if not has_leakage:
-        logger.info("✓ Patient-level cross-view data partition verified: ZERO leakage across all splits!")
-
-    return {
-        "is_independent": not has_leakage,
-        "splits": splits,
-        "patient_counts": {s: len(split_patients[s]) for s in splits},
-        "split_patients": split_patients,
-        "leakages": leakage_records,
-    }
+def cache_inventory(data_root):
+    root = Path(data_root)
+    result = {}
+    for folder, extension in (("train_npz", ".npz"), ("test_vol_h5", ".npy.h5")):
+        inventories = [{p.name[:-len(extension)] for p in (root / m / folder).glob("*" + extension)}
+                       for m in MODALITIES]
+        if not inventories[0]:
+            raise FileNotFoundError(f"No {folder} files found in {root}")
+        if any(ids != inventories[0] for ids in inventories[1:]):
+            raise ValueError(f"Modality file IDs differ in {folder}")
+        for name in inventories[0]:
+            patient_id(name)
+        result[folder] = inventories[0]
+    validate_patient_splits({"non_test": sorted(result["train_npz"]),
+                             "test": sorted(result["test_vol_h5"])})
+    return result
 
 
-def get_lge_directory(data_root: Path) -> Path:
-    """Find the directory that directly contains task folders like SAX_TR."""
-    if not data_root.exists():
-        raise FileNotFoundError(f"Thư mục không tồn tại: {data_root}")
-
-    # 1. Check if data_root itself contains SAX_TR / SAX_VAL
-    direct_match = any(TASK_DIR_PATTERN.match(p.name) for p in data_root.iterdir() if p.is_dir())
-    if direct_match:
-        return data_root
-
-    # 2. Check if data_root/LGE_MULTI exists
-    if (data_root / "LGE_MULTI").exists():
-        return data_root / "LGE_MULTI"
-
-    # 3. Look for any directory named LGE_MULTI inside data_root
-    for p in data_root.rglob("LGE_MULTI"):
-        if p.is_dir():
-            return p
-
-    # 4. Search recursively for any folder containing task dirs (ignoring CINE)
-    for p in data_root.rglob("*_TR"):
-        if p.is_dir() and "CINE" not in p.as_posix().upper():
-            return p.parent
-
-    raise FileNotFoundError(
-        f"Không tìm thấy các thư mục LGE (như SAX_TR, SAX_VAL) trong '{data_root}'.\n"
-        f"Nội dung hiện tại trong '{data_root}': {[p.name for p in data_root.iterdir()]}"
-    )
-
-
-def scan_lge(lge_dir: Path) -> list[dict]:
-    records = []
-    for task_dir in sorted(lge_dir.iterdir()):
-        if not task_dir.is_dir():
-            continue
-        match = TASK_DIR_PATTERN.match(task_dir.name)
-        if not match:
-            continue
-        view, split_code = match.groups()
-        view = view.upper()
-        split = SPLIT_ALIASES.get(split_code.upper(), split_code.lower())
-
-        image_dir = task_dir / "image"
-        label_dir = task_dir / "anno"
-        if not image_dir.exists():
-            continue
-
-        label_map = (
-            {p.name: p for p in label_dir.glob("*.nii*")}
-            if label_dir.exists()
-            else {}
-        )
-
-        for img_path in sorted(image_dir.glob("*.nii*")):
-            fm = FILE_PATTERN.match(img_path.name)
-            if not fm:
-                continue
-            subject_id = f"{int(fm.group(2)):03d}"
-            label_path = label_map.get(img_path.name)
-
-            records.append(
-                {
-                    "record_id": f"lge_{view.lower()}_{split}_{subject_id}",
-                    "view": view,
-                    "split": split,
-                    "subject_id": subject_id,
-                    "image_path": img_path.relative_to(lge_dir).as_posix(),
-                    "label_path": (
-                        label_path.relative_to(lge_dir).as_posix()
-                        if label_path
-                        else None
-                    ),
-                    "has_label": label_path is not None,
-                }
-            )
-    return records
+def build_splits(data_root, list_dir, test_list=None, seed=1234, val_fraction=0.2, raw_root=None):
+    inventory = cache_inventory(data_root)
+    slices, tests = inventory["train_npz"], inventory["test_vol_h5"]
+    cases = {patient_id(name) for name in slices} | tests
+    if test_list:
+        path = Path(test_list)
+        fixed_test = set(read_split_names(path.parent, path.stem))
+        if fixed_test != tests:
+            raise ValueError("Fixed held-out patient list differs from cached test volumes")
+    if raw_root and set(discover_cases(raw_root)) != cases:
+        raise ValueError("Raw patient IDs differ from cached patients")
+    destination = Path(list_dir)
+    names = ("train", "val", "val_vol", "test_vol")
+    present = [(destination / f"{name}.txt").is_file() for name in names]
+    if any(present):
+        if not all(present):
+            raise ValueError("Incomplete manifests; choose a new list-dir instead of mixing old and new splits")
+        splits = {name: read_split_names(destination, name) for name in names}
+        if set(splits["train"]) | set(splits["val"]) != slices or set(splits["test_vol"]) != tests:
+            raise ValueError("Existing manifests do not match the complete cache inventory")
+        if set(splits["val_vol"]) != {patient_id(n) for n in splits["val"]}:
+            raise ValueError("val_vol IDs must exactly match validation slice patients")
+    else:
+        assigned = create_patient_splits(sorted(cases), seed=seed, val_fraction=val_fraction,
+                                         test_ids=sorted(tests))
+        splits = {name: sorted(n for n in slices if patient_id(n) in set(assigned[name]))
+                  for name in ("train", "val")}
+        splits.update(val_vol=assigned["val"], test_vol=sorted(tests))
+    patients = validate_patient_splits({k: splits[k] for k in ("train", "val", "test_vol")})
+    if not splits["train"] or not splits["val"]:
+        raise ValueError("Training and validation must both be nonempty")
+    if not any(present):
+        for name, values in splits.items():
+            _write_manifest(destination / f"{name}.txt", values)
+        metadata = {"seed": seed, "val_fraction_of_non_test_patients": val_fraction,
+                    "data_root": str(Path(data_root).resolve()),
+                    "fixed_test_list": str(Path(test_list).resolve()) if test_list else None,
+                    "patient_counts": {k: len(v) for k, v in patients.items()}}
+        (destination / "split_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return {"patient_counts": {k: len(v) for k, v in patients.items()},
+            "sample_counts": {k: len(v) for k, v in splits.items()}, "list_dir": str(destination.resolve())}
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build LGE train/val/test splits.")
-    parser.add_argument("--data-root", default="data/LGE_MULTI", help="Path to LGE_MULTI data directory")
-    parser.add_argument("--output", default="data/processed/splits", help="Output directory for CSV files")
-    parser.add_argument("--view", default=None, help="Filter by view: SAX, 2CH, 4CH, RAS")
-    parser.add_argument("--strict", action="store_true", default=True, help="Raise RuntimeError on patient-level data leakage (default: True)")
-    args = parser.parse_args()
-
-    data_root = Path(args.data_root).resolve()
-    logger.info("Scanning data root: %s", data_root)
-
-    lge_dir = get_lge_directory(data_root)
-    logger.info("Found LGE task folders at: %s", lge_dir)
-
-    records = scan_lge(lge_dir)
-    if not records:
-        raise RuntimeError(
-            f"Không tìm thấy file ảnh LGE nào trong '{lge_dir}'. "
-            f"Hãy đảm bảo cấu trúc gồm SAX_TR/image/*.nii.gz, SAX_VAL/image/*.nii.gz..."
-        )
-
-    if args.view:
-        records = [r for r in records if r["view"] == args.view.upper()]
-
-    df = pd.DataFrame(records)
-    out_dir = Path(args.output).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save manifest
-    df.to_csv(out_dir / "manifest.csv", index=False)
-
-    # Save per-split CSVs
-    for split in ("train", "validation", "test"):
-        subset = df[df["split"] == split]
-        subset.to_csv(out_dir / f"{split}.csv", index=False)
-        logger.info("  %s: %d records", f"{split:12s}", len(subset))
-
-    logger.info("Splits CSVs saved to %s", out_dir)
-    logger.info("Total: %d records across %d views.", len(df), df["view"].nunique())
-
-    # ---- Patient-level cross-view data leakage check ----
-    verify_split_independence(df, strict=args.strict)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", default="E:/STUDY/DATASET/MyoPS380/Processed_data")
+    parser.add_argument("--list-dir", default=str(ROOT / "data/processed/splits"))
+    parser.add_argument("--test-list", default=str(ROOT / "preprocessing/splits/test_vol.txt"))
+    parser.add_argument("--raw-root", default=None)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    result = build_splits(**vars(parser.parse_args(argv)))
+    print(json.dumps(result, indent=2))
+    return result
 
 
 if __name__ == "__main__":

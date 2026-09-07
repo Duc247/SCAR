@@ -1,225 +1,120 @@
-"""Inference entry point: load checkpoint and save segmentation masks.
-
-Usage:
-    python training/predict.py \
-        --config outputs/runs/unet3d_lge_sax_exp01/config_snapshot.yaml \
-        --checkpoint outputs/runs/unet3d_lge_sax_exp01/checkpoints/best.pt \
-        --split validation
-"""
-
+"""Batched 3D volume inference."""
 from __future__ import annotations
 
 import argparse
-import logging
-import sys
 from pathlib import Path
-
-import nibabel as nib
-import numpy as np
-import pandas as pd
-import torch
-import yaml
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from training.models import build_model
-from preprocessing.preprocessing import (
-    extract_tissue_foreground,
-    invert_spatial_mask,
-    preprocess_spatial,
-)
-from training.postprocess import decode_with_rules, enforce_anatomical_constraints
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-logger = logging.getLogger(__name__)
+import numpy as np
+import torch
+from torch.nn import functional as F
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run LGE segmentation inference.")
-    parser.add_argument("--config", required=True, help="Config snapshot YAML")
-    parser.add_argument("--checkpoint", required=True, help="Model checkpoint .pt")
-    parser.add_argument("--split", default="validation", choices=["train", "validation", "test"])
-    parser.add_argument("--output", default=None, help="Output directory (default: run_dir/predictions)")
-    args = parser.parse_args()
+@torch.inference_mode()
+def predict_volume(model, images, img_size=128, batch_size=8, device=None, amp_dtype=None):
+    """Aligned H,W,D volumes -> H,W,D labels, batching adjacent slices.
 
-    config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Resize images bilinearly to model grid; resize logits back before argmax.
+    """
+    arrays = [np.asarray(value, dtype=np.float32) for value in images]
+    if len(arrays) != 3 or any(a.ndim != 3 for a in arrays) or any(a.shape != arrays[0].shape for a in arrays):
+        raise ValueError("Expected three aligned H,W,D arrays.")
+    if not all(np.isfinite(a).all() for a in arrays):
+        raise ValueError("Non-finite inference inputs.")
+    if batch_size < 1 or img_size < 32 or img_size % 16 or any(v < 1 for v in arrays[0].shape):
+        raise ValueError("Use nonempty volumes, positive batch_size and img_size >=32 divisible by 16.")
+    device = torch.device(device or next(model.parameters()).device)
+    height, width, depth = arrays[0].shape
+    prediction = np.empty((height, width, depth), dtype=np.uint8)
+    was_training = model.training
+    model.eval()
+    try:
+        for start in range(0, depth, batch_size):
+            stop = min(start + batch_size, depth)
+            inputs = [
+                torch.from_numpy(np.ascontiguousarray(a[:, :, start:stop].transpose(2, 0, 1))).unsqueeze(1).to(device)
+                for a in arrays
+            ]
+            inputs = [
+                F.interpolate(x, (img_size, img_size), mode="bilinear", align_corners=False)
+                if x.shape[-2:] != (img_size, img_size)
+                else x
+                for x in inputs
+            ]
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                logits = model(*inputs)
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError("Non-finite inference logits.")
+            if logits.shape[-2:] != (height, width):
+                logits = F.interpolate(logits.float(), (height, width), mode="bilinear", align_corners=False)
+            prediction[:, :, start:stop] = logits.argmax(1).cpu().numpy().transpose(1, 2, 0)
+    finally:
+        model.train(was_training)
+    return prediction
 
-    # Model
-    num_classes = int(config.get("num_classes", 5))
-    model = build_model(config["model_name"], **{**config.get("model", {}), "num_classes": num_classes})
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+
+def main(argv=None):
+    """Predict on raw, aligned NIfTI and preserve its native reference grid."""
+    import nibabel as nib
+    from ml_collections import ConfigDict
+    from preprocessing.preprocessing import MODALITIES, load_aligned_images
+    from training.models.cmspa_net import CMSPANet
+    from training.trainer.trainer import load_checkpoint, resolve_device, resolve_amp, write_json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--cine", required=True, help="Aligned bSSFP NIfTI")
+    parser.add_argument("--lge", required=True)
+    parser.add_argument("--t2w", required=True)
+    parser.add_argument("--output", required=True, help="New prediction .nii.gz path")
+    parser.add_argument("--normalization", required=True, choices=("unit255", "unit", "percentile"),
+                        help="Use the normalization chosen when packaging training data")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--amp", choices=("auto", "none", "fp16", "bf16"), default="auto")
+    parser.add_argument("--cpu-threads", type=int, default=4)
+    args = parser.parse_args(argv)
+    if args.batch_size < 1 or args.cpu_threads < 1:
+        parser.error("batch-size and cpu-threads must be positive")
+    output = Path(args.output).resolve()
+    if not (output.name.endswith(".nii.gz") or output.suffix == ".nii"):
+        parser.error("output must end in .nii or .nii.gz")
+    if output.exists():
+        raise FileExistsError(f"Output already exists: {output}")
+    paths = dict(zip(MODALITIES, (args.cine, args.lge, args.t2w)))
+    images, spacing, affine, unit = load_aligned_images(paths, args.normalization)
+    checkpoint = load_checkpoint(args.checkpoint)
+    recorded = checkpoint.get("data_provenance", {}).get("metadata", {}).get("normalization")
+    if recorded and recorded != args.normalization:
+        raise ValueError(f"Normalization differs from training: {recorded}")
+    torch.set_num_threads(args.cpu_threads)
+    device = resolve_device(args.device)
+    amp = resolve_amp(args.amp, device)
+    model = CMSPANet(ConfigDict(checkpoint["model_config"]), img_size=checkpoint["args"]["img_size"])
+    model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
-    logger.info("Loaded checkpoint from epoch %d", ckpt.get("epoch", -1))
-
-    # Data
-    splits_dir = ROOT / config["data"]["splits_dir"]
-    df = pd.read_csv(splits_dir / f"{args.split}.csv")
-    view = str(config.get("view", "SAX")).upper()
-    df = df[df["view"] == view]
-    raw_root = ROOT / config["data"]["raw_root"]
-
-    pp = config.get("preprocessing", {})
-    target_shape = tuple(pp["target_shape"])
-    target_spacing = tuple(pp["target_spacing"])
-    percentiles = tuple(pp["intensity_percentiles"]) if pp.get("intensity_percentiles") else None
-
-    post_cfg = config.get("postprocess", {})
-    use_rules = post_cfg.get("use_rules", True)
-    in_channels = int(config.get("training", {}).get("in_channels", config.get("model", {}).get("in_channels", 1)))
-
-    # Output dir
-    run_dir = Path(args.config).parent
-    out_dir = Path(args.output) if args.output else run_dir / "predictions" / args.split
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for _, row in df.iterrows():
-        raw_nii_obj = nib.load(str(raw_root / row.image_path))
-        nii_obj = nib.as_closest_canonical(raw_nii_obj)
-        raw_image = np.asanyarray(nii_obj.dataobj)
-        zooms = nii_obj.header.get_zooms()
-
-        # --- CASE 1: 3D SAX ---
-        if view == "SAX" and len(target_shape) == 3:
-            if raw_image.ndim == 4:
-                if raw_image.shape[-1] == 1:
-                    raw_image = raw_image[..., 0]
-                    zooms = zooms[:3]
-                elif raw_image.shape[0] == 1:
-                    raw_image = raw_image[0, ...]
-                    zooms = zooms[1:4]
-                else:
-                    raw_image = raw_image[:, :, :, 0]
-                    zooms = zooms[:3]
-
-            spacing = tuple(float(v) for v in zooms[:3])
-            processed, transform = preprocess_spatial(
-                raw_image,
-                source_spacing=spacing,
-                target_spacing=target_spacing,
-                target_shape=target_shape,
-                interpolation_order=1,
-                intensity_percentiles=percentiles,
-            )
-            proc_dhw = np.transpose(processed, (2, 0, 1))  # (D, H, W)
-            tensor = torch.from_numpy(proc_dhw[None, None, ...]).to(device, dtype=torch.float32)
-
-            with torch.no_grad():
-                logits = model(tensor)
-                if logits.shape[1] == num_classes - 1:
-                    pred_dhw = decode_with_rules(logits, view=view)[0].cpu().numpy().astype(np.int16)
-                elif use_rules and logits.shape[1] == num_classes:
-                    pred_dhw = decode_with_rules(logits[:, 1:], view=view)[0].cpu().numpy().astype(np.int16)
-                else:
-                    pred_dhw = torch.argmax(logits, dim=1)[0].cpu().numpy().astype(np.int16)
-
-            pred_processed = np.transpose(pred_dhw, (1, 2, 0))  # (H, W, D)
-            restored_pred = invert_spatial_mask(pred_processed, transform)
-
-        # --- CASE 2: 2D LAX (2CH, 4CH, RAS) ---
-        else:
-            if raw_image.ndim == 4:
-                if raw_image.shape[-1] == 1:
-                    raw_image = raw_image[..., 0]
-                    zooms = zooms[:3]
-                elif raw_image.shape[0] == 1:
-                    raw_image = raw_image[0, ...]
-                    zooms = zooms[1:4]
-                else:
-                    raw_image = raw_image[:, :, :, 0]
-                    zooms = zooms[:3]
-
-            spacing = tuple(float(v) for v in zooms[:2])
-            d_count = raw_image.shape[2] if raw_image.ndim >= 3 else 1
-            restored_slices = []
-
-            # Global foreground intensity bounds across full volume (fixes C1)
-            precomputed_bounds = None
-            if percentiles is not None:
-                full_vol = np.asarray(raw_image, dtype=np.float32)
-                fg = extract_tissue_foreground(full_vol)
-                p_low, p_high = np.percentile(fg, percentiles)
-                if np.isfinite(p_low) and np.isfinite(p_high) and p_high > p_low:
-                    precomputed_bounds = (float(p_low), float(p_high))
-
-            for s in range(d_count):
-                if in_channels == 3 and raw_image.ndim >= 3:
-                    # Edge clamping on boundaries (preserves through-plane gradient)
-                    prev_idx = max(0, s - 1)
-                    curr_idx = s
-                    next_idx = min(d_count - 1, s + 1)
-                    slices_data = [raw_image[:, :, prev_idx], raw_image[:, :, curr_idx], raw_image[:, :, next_idx]]
-                    processed_channels = []
-                    trans_s = None
-                    for s_data in slices_data:
-                        p_img, t_obj = preprocess_spatial(
-                            s_data,
-                            source_spacing=spacing,
-                            target_spacing=target_spacing,
-                            target_shape=target_shape,
-                            interpolation_order=1,
-                            intensity_percentiles=None if precomputed_bounds is not None else percentiles,
-                            precomputed_intensity_bounds=precomputed_bounds,
-                        )
-                        processed_channels.append(p_img)
-                        if trans_s is None:
-                            trans_s = t_obj
-                    stacked = np.stack(processed_channels, axis=0)
-                    t_sl = torch.from_numpy(stacked[None, ...]).to(device, dtype=torch.float32)
-                else:
-                    slice_img = raw_image[:, :, s] if raw_image.ndim >= 3 else raw_image
-                    p_sl, trans_s = preprocess_spatial(
-                        slice_img,
-                        source_spacing=spacing,
-                        target_spacing=target_spacing,
-                        target_shape=target_shape,
-                        interpolation_order=1,
-                        intensity_percentiles=None if precomputed_bounds is not None else percentiles,
-                        precomputed_intensity_bounds=precomputed_bounds,
-                    )
-                    stacked = p_sl[None, ...]
-                    if in_channels == 3:
-                        stacked = np.repeat(stacked, 3, axis=0)
-                    t_sl = torch.from_numpy(stacked[None, ...]).to(device, dtype=torch.float32)
-
-                with torch.no_grad():
-                    logits = model(t_sl)
-                    if logits.shape[1] == num_classes - 1:
-                        p_out = decode_with_rules(logits, view=view)[0].cpu().numpy().astype(np.int16)
-                    elif use_rules and logits.shape[1] == num_classes:
-                        p_out = decode_with_rules(logits[:, 1:], view=view)[0].cpu().numpy().astype(np.int16)
-                    else:
-                        p_out = torch.argmax(logits, dim=1)[0].cpu().numpy().astype(np.int16)
-
-                rest_s = invert_spatial_mask(p_out, trans_s)
-                restored_slices.append(rest_s)
-
-            restored_pred = np.stack(restored_slices, axis=-1) if raw_image.ndim >= 3 else restored_slices[0]
-
-        # Apply anatomical constraints (spacing & physical volume aware)
-        if post_cfg.get("anatomical_constraint", True):
-            full_spacing = tuple(float(v) for v in zooms[:restored_pred.ndim])
-            restored_pred = enforce_anatomical_constraints(
-                restored_pred,
-                scar_class=3,
-                myo_class=2,
-                dilation_voxels=int(post_cfg.get("dilation_voxels", 1)),
-                tolerance_mm=float(post_cfg.get("tolerance_mm", 2.5)),
-                spacing=full_spacing,
-                min_scar_voxels=int(post_cfg.get("min_scar_voxels", 5)),
-                min_scar_volume_mm3=float(post_cfg.get("min_scar_volume_mm3", 15.0)),
-            )
-
-        # Save restored NIfTI prediction
-        mask = restored_pred
-        out_nii = nib.Nifti1Image(mask.astype(np.uint8), nii_obj.affine, nii_obj.header)
-        out_path = out_dir / Path(row.image_path).name
-        nib.save(out_nii, str(out_path))
-        logger.info("Saved: %s", out_path.name)
-
-    logger.info("Predictions saved to %s", out_dir)
+    prediction = predict_volume(model, [images[m] for m in MODALITIES],
+                                checkpoint["args"]["img_size"], args.batch_size, device, amp)
+    reference = nib.load(args.cine)
+    header = reference.header.copy()
+    header.set_data_dtype(np.uint8)
+    header.set_intent("label")
+    header["descrip"] = b"SCAR canonical: 0 background, 1 normal, 2 edema, 3 scar"
+    result = nib.Nifti1Image(prediction, affine, header)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(result, str(output))
+    write_json(output.with_suffix(output.suffix + ".json"), {
+        "checkpoint": str(Path(args.checkpoint).resolve()), "normalization": args.normalization,
+        "class_names": list(checkpoint["class_names"]), "shape": list(prediction.shape),
+        "spatial_unit": unit, "native_spacing": spacing.tolist(),
+        "affine": affine.tolist(), "inputs": {k: str(Path(v).resolve()) for k, v in paths.items()},
+    })
+    print(f"Saved {output} | shape={prediction.shape} | native unit={unit}")
+    return output
 
 
 if __name__ == "__main__":

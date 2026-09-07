@@ -1,7 +1,4 @@
-"""Trainer module for LGE segmentation."""
+"""SCAR training and checkpoint utilities."""
+from training.trainer.trainer import Trainer, load_checkpoint, run_epoch, seed_everything
 
-from __future__ import annotations
-
-from training.trainer.trainer import EarlyStopping, LgeTrainer, Trainer
-
-__all__ = ["EarlyStopping", "LgeTrainer", "Trainer"]
+__all__ = ["Trainer", "load_checkpoint", "run_epoch", "seed_everything"]

@@ -1,52 +1,310 @@
-"""Trainer class for LGE Cardiac MRI segmentation models."""
-
+"""Observable single-device training, validation, and resumable checkpoints."""
 from __future__ import annotations
 
+import csv
+import hashlib
+import importlib.metadata
 import json
 import logging
 import math
+import os
 from pathlib import Path
-from typing import Any, Callable
+import random
+import sys
+import time
+from typing import Any
 
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import _LRScheduler
+from torch import nn
 from torch.utils.data import DataLoader
 
-import sys
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+from training.dataset.data_contract import CLASS_NAMES, ensure_patient_splits
+from training.dataset.myops_dataset import (
+    MyopsDataset,
+    RandomGenerator,
+    ResizeGenerator,
+)
+from training.loss.losses import SegmentationLoss
+from training.metrics.confusion_meter import ConfusionMeter
+from training.dataset.sampler import build_rare_class_sampler
 
-from training.metrics import dice_score
-from training.postprocess import decode_with_rules, enforce_anatomical_constraints
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-logger = logging.getLogger(__name__)
+def seed_everything(seed: int, deterministic: bool = True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+
+
+def seed_worker(worker_id: int):
+    seed = torch.initial_seed() % 2**32
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def resolve_device(name: str = "auto") -> torch.device:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if name == "auto" else torch.device(name)
+    if device.type not in ("cpu", "cuda"):
+        raise ValueError("This pipeline supports CPU or CUDA.")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable in this PyTorch installation.")
+    return device
+
+
+def resolve_amp(mode: str, device: torch.device):
+    if mode == "none" or (mode == "auto" and device.type == "cpu"):
+        return None
+    if device.type != "cuda":
+        raise ValueError("Mixed precision is enabled only on CUDA; use --amp none on CPU.")
+    if mode not in {"auto", "none", "fp16", "bf16"}:
+        raise ValueError(f"Unknown AMP mode: {mode}")
+    if mode == "auto":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if mode == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError("This CUDA device does not support bfloat16.")
+        return torch.bfloat16
+    return torch.float16
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (float, np.floating)) and not math.isfinite(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def write_json(path: Path | str, payload: Any):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(json_safe(payload), indent=2, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def atomic_checkpoint(path: Path | str, payload: dict[str, Any]):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def load_checkpoint(path: Path | str) -> dict[str, Any]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict) or checkpoint.get("format_version") != 1:
+        raise ValueError(
+            "Expected a SCAR M0-M3 pipeline checkpoint (format_version=1)."
+        )
+    if tuple(checkpoint.get("class_names", ())) != CLASS_NAMES:
+        raise ValueError("Checkpoint label semantics do not match this pipeline.")
+    return checkpoint
+
+
+def rng_state() -> dict[str, Any]:
+    state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": [state[0], state[1].tolist(), state[2], state[3], state[4]],
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng(state: dict[str, Any]):
+    random.setstate(state["python"])
+    s = state["numpy"]
+    np.random.set_state((s[0], np.asarray(s[1], dtype=np.uint32), s[2], s[3], s[4]))
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state["cuda"]:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def make_logger(directory: Path) -> logging.Logger:
+    logger = logging.getLogger("scar.train")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    for handler in (
+        logging.FileHandler(directory / "train.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+def _configs_equal(c1: Any, c2: Any) -> bool:
+    """Recursively compare configurations normalizing sequences (tuples and lists)."""
+    if isinstance(c1, dict) and isinstance(c2, dict):
+        if set(c1.keys()) != set(c2.keys()):
+            return False
+        return all(_configs_equal(c1[k], c2[k]) for k in c1)
+    if isinstance(c1, (list, tuple)) and isinstance(c2, (list, tuple)):
+        if len(c1) != len(c2):
+            return False
+        return all(_configs_equal(v1, v2) for v1, v2 in zip(c1, c2))
+    return c1 == c2
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+    scheduler: Any = None,
+    accum_steps: int = 1,
+    clip_grad: float = 1.0,
+    log_every: int = 20,
+    logger: logging.Logger | None = None,
+    writer: Any = None,
+    global_step: int = 0,
+) -> tuple[dict[str, Any], int]:
+    training = optimizer is not None
+    if accum_steps < 1 or log_every < 1:
+        raise ValueError("accum_steps and log_every must be positive")
+    if training and scaler is None:
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
+    model.train(training)
+    meter = ConfusionMeter(device=device)
+    sums = torch.zeros(3, device=device, dtype=torch.float64)
+    sample_count, skipped_steps, grad_norm_sum, updates, group_samples = 0, 0, 0.0, 0, 0
+    if training:
+        optimizer.zero_grad(set_to_none=True)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    with torch.set_grad_enabled(training):
+        for batch_index, batch in enumerate(loader):
+            images = [batch[key].to(device, non_blocking=loader.pin_memory) for key in ("image", "image1", "image2")]
+            target = batch["label"].to(device, non_blocking=loader.pin_memory)
+            batch_count = target.shape[0]
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                logits = model(*images)
+                losses = criterion(logits, target)
+            if not all(torch.isfinite(v) for v in losses.values()):
+                raise FloatingPointError(f"Non-finite loss at batch {batch_index}: {batch.get('case_name')}")
+            sums += torch.stack([losses[key].detach() for key in ("loss", "ce", "dice_loss")]).double() * batch_count
+            sample_count += batch_count
+            meter.update(logits.detach().argmax(1), target)
+            if training:
+                scaler.scale(losses["loss"] * batch_count).backward()
+                group_samples += batch_count
+                boundary = (batch_index + 1) % accum_steps == 0 or batch_index + 1 == len(loader)
+                if boundary:
+                    scaler.unscale_(optimizer)
+                    for parameter in model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.div_(group_samples)
+                    norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), clip_grad if clip_grad > 0 else float("inf")
+                    )
+                    finite_gradient = bool(torch.isfinite(norm))
+                    if not finite_gradient and not scaler.is_enabled():
+                        raise FloatingPointError(f"Non-finite gradient at batch {batch_index}.")
+                    if not finite_gradient and scaler.is_enabled():
+                        finite_entries = all(
+                            bool(torch.isfinite(p.grad).all()) for p in model.parameters() if p.grad is not None
+                        )
+                        if finite_entries:
+                            raise FloatingPointError(
+                                "Gradient norm overflowed despite finite entries; reduce the loss/gradient scale."
+                            )
+                    old_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    skipped = scaler.get_scale() < old_scale
+                    if skipped:
+                        skipped_steps += 1
+                        if logger:
+                            logger.warning(
+                                "AMP overflow: optimizer update skipped at batch %d, new scale %.1f",
+                                batch_index,
+                                scaler.get_scale(),
+                            )
+                    else:
+                        if scheduler is not None:
+                            scheduler.step()
+                        global_step += 1
+                        updates += 1
+                        grad_norm_sum += float(norm)
+                    if writer and (global_step % log_every == 0 or skipped):
+                        writer.add_scalar("step/loss", float(losses["loss"].detach()), global_step)
+                        writer.add_scalar("step/grad_norm", float(norm), global_step)
+                        writer.add_scalar("step/amp_scale", scaler.get_scale(), global_step)
+                    optimizer.zero_grad(set_to_none=True)
+                    group_samples = 0
+            if logger and ((batch_index + 1) % log_every == 0 or batch_index + 1 == len(loader)):
+                logger.info(
+                    "%s batch %d/%d | loss %.5f | ce %.5f | dice_loss %.5f",
+                    "train" if training else "val",
+                    batch_index + 1,
+                    len(loader),
+                    *[float(v) / sample_count for v in sums],
+                )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    if sample_count == 0:
+        raise ValueError("Cannot run an epoch with an empty data loader")
+    metrics = {key: float(value) / sample_count for key, value in zip(("loss", "ce", "dice_loss"), sums)}
+    metrics.update(meter.compute())
+    metrics.update(
+        seconds=elapsed,
+        samples_per_second=sample_count / elapsed,
+        samples=sample_count,
+        gpu_peak_allocated_mb=torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0.0,
+        gpu_peak_reserved_mb=torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0.0,
+    )
+    if training:
+        metrics.update(
+            grad_norm=grad_norm_sum / max(updates, 1),
+            amp_skipped_steps=skipped_steps,
+            optimizer_updates=updates,
+            amp_scale=scaler.get_scale(),
+        )
+        if updates == 0:
+            raise FloatingPointError("No optimizer updates succeeded in this epoch. Check AMP scale/input ranges.")
+    return metrics, global_step
 
 
 class EarlyStopping:
-    """Early stopping callback."""
+    """Early stopping monitor based on validation score."""
 
-    def __init__(self, patience: int = 30, min_delta: float = 1e-4, mode: str = "max") -> None:
+    def __init__(self, patience: int = 0, min_delta: float = 0.0, mode: str = "max"):
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
-        self.best_score: float = -math.inf if mode == "max" else math.inf
+        self.best_score = -float("inf") if mode == "max" else float("inf")
         self.counter = 0
         self.early_stop = False
 
     def step(self, score: float) -> bool:
-        if np.isnan(score):
-            return self.early_stop
-
-        improved = (
-            score > self.best_score + self.min_delta
-            if self.mode == "max"
-            else score < self.best_score - self.min_delta
-        )
+        if self.patience <= 0:
+            return False
+        if self.mode == "max":
+            improved = score > self.best_score + self.min_delta
+        else:
+            improved = score < self.best_score - self.min_delta
 
         if improved:
             self.best_score = score
@@ -55,344 +313,315 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-
-        return self.early_stop
+        return improved
 
 
 class Trainer:
-    """Multi-view LGE Segmentation Trainer."""
+    """Run the configured dataset, optimizer, validation, and checkpoint pipeline.
 
-    def __init__(
-        self,
-        *,
-        model: nn.Module,
-        optimizer: Optimizer,
-        loss_fn: nn.Module,
-        scheduler: _LRScheduler | None = None,
-        device: torch.device,
-        num_classes: int | None = None,
-        checkpoint_dir: Path | str | None = None,
-        run_dir: Path | str | None = None,
-        config: dict | None = None,
-        view: str | None = None,
-    ) -> None:
+    Training configuration is the single source of truth. ``fit`` never silently
+    replaces caller-supplied optimizers or data loaders.
+    """
+
+    def __init__(self, model: nn.Module, args: Any, run_dir: Path | str):
         self.model = model
-        self.optimizer = optimizer
-        self.loss_fn = loss_fn
-        self.scheduler = scheduler
-        self.device = device
-        self.config = config or {}
+        self.args = args
+        self.run_dir = Path(run_dir)
 
-        # Resolve num_classes
-        if num_classes is not None:
-            self.num_classes = int(num_classes)
-        elif "num_classes" in self.config:
-            self.num_classes = int(self.config["num_classes"])
-        else:
-            self.num_classes = 5
+    def fit(self) -> dict[str, Any]:
+        return trainer_Myops(self.args, self.model, self.run_dir)
 
-        # Resolve view
-        if view is not None:
-            self.view = str(view).upper()
-        elif "view" in self.config:
-            self.view = str(self.config["view"]).upper()
-        else:
-            self.view = "SAX"
 
-        # Resolve run_dir & checkpoint_dir & logs_dir
-        if run_dir is not None:
-            self.run_dir = Path(run_dir)
-        elif checkpoint_dir is not None:
-            self.run_dir = Path(checkpoint_dir).parent
-        else:
-            self.run_dir = Path("outputs/runs")
-
-        if checkpoint_dir is not None:
-            self.checkpoint_dir = Path(checkpoint_dir)
-        else:
-            self.checkpoint_dir = self.run_dir / "checkpoints"
-
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.logs_dir = self.run_dir / "logs"
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-
-        self.history: list[dict[str, Any]] = []
-
-    def _train_epoch(self, dataloader: DataLoader) -> float:
-        self.model.train()
-        losses = []
-
-        for batch in dataloader:
-            images = batch["image"].to(self.device, dtype=torch.float32)
-            labels = batch["label"].to(self.device, dtype=torch.long)
-
-            self.optimizer.zero_grad()
-            logits = self.model(images)
-            loss = self.loss_fn(logits, labels)
-
-            loss.backward()
-            max_grad_norm = float(self.config.get("training", {}).get("max_grad_norm", 1.0))
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
-            self.optimizer.step()
-
-            losses.append(float(loss.detach().cpu()))
-
-        if self.scheduler is not None:
-            self.scheduler.step()
-
-        return float(np.mean(losses)) if losses else math.nan
-
-    def _validate_epoch(self, dataloader: DataLoader) -> tuple[float, dict[str, float]]:
-        """Validate model on the validation DataLoader in preprocessed batch space.
-        
-        Uses Subject-Level Macro-Dice aligned with Metrics Reloaded (Nature Methods 2024)
-        and training/evaluate.py standards. Slices belonging to the same subject are aggregated
-        before computing per-subject Dice, and True Negative subjects (GT=0, Pred=0) evaluate to 1.0.
-        """
-        self.model.eval()
-        losses = []
-
-        # Subject-level voxel counters: subject_id -> class_id -> count
-        subj_inter: dict[str, dict[int, int]] = {}
-        subj_gt: dict[str, dict[int, int]] = {}
-        subj_pred: dict[str, dict[int, int]] = {}
-        sample_idx = 0
-
-        with torch.no_grad():
-            for batch in dataloader:
-                images = batch["image"].to(self.device, dtype=torch.float32)
-                labels = batch["label"].to(self.device, dtype=torch.long)
-
-                logits = self.model(images)
-                loss = self.loss_fn(logits, labels)
-                losses.append(float(loss.detach().cpu()))
-
-                # Decode logits: One-vs-Rest or Softmax Argmax
-                post_cfg = self.config.get("postprocess", {})
-                use_rules = post_cfg.get("use_rules", True)
-
-                if logits.shape[1] == self.num_classes - 1:
-                    preds_tensor = decode_with_rules(logits, view=self.view)
-                elif use_rules and logits.shape[1] == self.num_classes:
-                    preds_tensor = decode_with_rules(logits[:, 1:], view=self.view)
-                else:
-                    preds_tensor = torch.argmax(logits, dim=1)
-
-                preds_np = preds_tensor.cpu().numpy()
-
-                # Apply anatomical constraints if enabled
-                if post_cfg.get("anatomical_constraint", True):
-                    cleaned_preds = []
-                    for b in range(preds_np.shape[0]):
-                        cleaned = enforce_anatomical_constraints(
-                            preds_np[b],
-                            scar_class=3,
-                            myo_class=2,
-                            dilation_voxels=int(post_cfg.get("dilation_voxels", 1)),
-                            tolerance_mm=float(post_cfg.get("tolerance_mm", 2.5)),
-                            min_scar_voxels=int(post_cfg.get("min_scar_voxels", 5)),
-                            min_scar_volume_mm3=float(post_cfg.get("min_scar_volume_mm3", 15.0)),
-                        )
-                        cleaned_preds.append(cleaned)
-                    preds = np.stack(cleaned_preds, axis=0)
-                else:
-                    preds = preds_np
-
-                targets = labels.cpu().numpy()
-
-                # Resolve subject identifiers from batch metadata or fallback to sample index
-                batch_subjects = batch.get("subject_id")
-                if batch_subjects is None:
-                    batch_subjects = batch.get("record_id")
-
-                for b in range(len(preds)):
-                    if batch_subjects is not None:
-                        s_id = str(batch_subjects[b]) if not isinstance(batch_subjects, str) else str(batch_subjects)
-                    else:
-                        s_id = f"sample_{sample_idx}"
-                    sample_idx += 1
-
-                    if s_id not in subj_inter:
-                        subj_inter[s_id] = {c: 0 for c in range(1, self.num_classes)}
-                        subj_gt[s_id] = {c: 0 for c in range(1, self.num_classes)}
-                        subj_pred[s_id] = {c: 0 for c in range(1, self.num_classes)}
-
-                    for c in range(1, self.num_classes):
-                        p_mask = preds[b] == c
-                        t_mask = targets[b] == c
-                        subj_inter[s_id][c] += int((p_mask & t_mask).sum())
-                        subj_gt[s_id][c] += int(t_mask.sum())
-                        subj_pred[s_id][c] += int(p_mask.sum())
-
-        val_loss = float(np.mean(losses)) if losses else math.nan
-        metrics_summary: dict[str, float] = {}
-        all_subjects = list(subj_inter.keys())
-
-        for c in range(1, self.num_classes):
-            c_subject_dices: list[float] = []
-            for s_id in all_subjects:
-                gt_c = subj_gt[s_id][c]
-                pred_c = subj_pred[s_id][c]
-                inter_c = subj_inter[s_id][c]
-
-                # Metrics Reloaded (2024) Subject-Level Formulation
-                if gt_c == 0 and pred_c == 0:
-                    dice_val = 1.0  # Symmetric True Negative
-                elif gt_c == 0 or pred_c == 0:
-                    dice_val = 0.0  # Complete False Positive or False Negative
-                else:
-                    dice_val = float(2.0 * inter_c / (gt_c + pred_c))
-                c_subject_dices.append(dice_val)
-
-            metrics_summary[f"dice_class_{c}"] = float(np.mean(c_subject_dices)) if c_subject_dices else float("nan")
-
-        # Class 3 is SCAR in LGE SAX, 2CH, 4CH
-        if "dice_class_3" in metrics_summary:
-            metrics_summary["dice_scar"] = metrics_summary["dice_class_3"]
-
-        valid_means = [v for k, v in metrics_summary.items() if k.startswith("dice_class_") and not np.isnan(v)]
-        metrics_summary["mean_dice"] = float(np.mean(valid_means)) if valid_means else float("nan")
-
-        return val_loss, metrics_summary
-
-    def save_checkpoint(self, name: str, epoch: int, val_loss: float, metrics: dict[str, float]) -> None:
-        path = self.checkpoint_dir / f"{name}.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
-                "val_loss": val_loss,
-                "metrics": metrics,
-            },
-            path,
+def trainer_Myops(args, model, snapshot_path):
+    directory = Path(snapshot_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    logger = make_logger(directory)
+    device = resolve_device(args.device)
+    amp_dtype = resolve_amp(args.amp, device)
+    split_dir = ensure_patient_splits(
+        args.list_dir,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
+        output_dir=directory / "splits",
+    )
+    split_hashes = {
+        name: hashlib.sha256((split_dir / f"{name}.txt").read_bytes()).hexdigest()
+        for name in ("train", "val", "val_vol", "test_vol")
+        if (split_dir / f"{name}.txt").is_file()
+    }
+    roots = [str(Path(args.data_root) / modality / "train_npz") for modality in ("bSSFP", "LGE", "T2w")]
+    datasets = [
+        MyopsDataset(
+            *roots,
+            str(split_dir),
+            split,
+            transform=(RandomGenerator if split == "train" else ResizeGenerator)([args.img_size, args.img_size]),
+            label_order=args.label_order,
         )
+        for split in ("train", "val")
+    ]
+    if any(len(dataset) == 0 for dataset in datasets):
+        raise ValueError("Training and validation must both be nonempty.")
+    pin = args.pin_memory if args.pin_memory is not None else device.type == "cuda"
+    generator = torch.Generator().manual_seed(args.seed)
+    common = dict(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        worker_init_fn=seed_worker,
+        persistent_workers=False,
+    )
+    sampler = (build_rare_class_sampler(datasets[0], rare_boost=args.rare_boost,
+                                       foreground_boost=args.foreground_boost, generator=generator)
+               if args.sampler == "rare" else None)
+    trainloader = DataLoader(datasets[0], shuffle=sampler is None, sampler=sampler,
+                             generator=generator, **common)
+    valloader = DataLoader(datasets[1], shuffle=False, generator=torch.Generator().manual_seed(args.seed + 1), **common)
+    model.to(device)
+    criterion = SegmentationLoss(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr, weight_decay=args.weight_decay, foreach=False)
+    total_updates = args.max_epochs * math.ceil(len(trainloader) / args.accum_steps)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: max(0.0, 1.0 - step / total_updates) ** 0.9)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
+    start_epoch, global_step, best_score, best_epoch, bad_epochs = 0, 0, -float("inf"), -1, 0
+    patience_score = -float("inf")
+    model_config = model.config.to_dict()
+    metadata_path = Path(args.data_root) / "dataset_metadata.json"
+    data_provenance = {}
+    if metadata_path.is_file():
+        data_provenance = {"metadata": json.loads(metadata_path.read_text(encoding="utf-8")),
+                           "metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest()}
 
-    def load_checkpoint(self, path: Path | str) -> dict[str, Any]:
-        """Load checkpoint state into model, optimizer, and scheduler."""
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt and self.optimizer is not None:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"] is not None and self.scheduler is not None:
-            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        return ckpt
+    if args.resume:
+        checkpoint = load_checkpoint(args.resume)
+        if Path(checkpoint["args"]["data_root"]).resolve() != Path(args.data_root).resolve():
+            raise ValueError("Resume data-root differs from the original dataset. Keep the dataset path fixed.")
+        for key in (
+            "batch_size",
+            "accum_steps",
+            "max_epochs",
+            "base_lr",
+            "weight_decay",
+            "label_order",
+            "img_size",
+            "seed",
+            "amp",
+            "num_workers",
+            "deterministic",
+            "clip_grad",
+            "patience",
+            "min_delta",
+            "ce_weight",
+            "dice_weight",
+            "sampler",
+            "rare_boost",
+            "foreground_boost",
+        ):
+            if checkpoint["args"][key] != vars(args)[key]:
+                raise ValueError(
+                    f"Resume changes {key}: {checkpoint['args'][key]} -> {vars(args)[key]}. Use the original training settings."
+                )
+        if not _configs_equal(checkpoint["model_config"], model_config) or checkpoint["split_hashes"] != split_hashes:
+            raise ValueError("Resume architecture or train/val/test manifests differ from checkpoint.")
+        if checkpoint["total_updates"] != total_updates:
+            raise ValueError("Resume data length changes the learning-rate schedule.")
+        if checkpoint.get("data_provenance", {}) != data_provenance:
+            raise ValueError("Dataset preprocessing metadata changed since the checkpoint")
+        model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        scaler.load_state_dict(checkpoint["scaler"])
+        start_epoch, global_step = checkpoint["epoch"] + 1, checkpoint["global_step"]
+        best_score, best_epoch, bad_epochs = (
+            checkpoint["best_score"],
+            checkpoint["best_epoch"],
+            checkpoint["bad_epochs"],
+        )
+        patience_score = checkpoint["patience_score"]
+        generator.set_state(checkpoint["loader_rng"])
+        restore_rng(checkpoint["rng"])
+        logger.info("Resumed complete state at epoch %d, optimizer update %d", start_epoch + 1, global_step)
+        del checkpoint
 
-    def _save_history(self) -> None:
-        """Save history to JSON and CSV in both run_dir and run_dir/logs."""
+    config_record = dict(
+        args=vars(args),
+        model_config=model_config,
+        class_names=CLASS_NAMES,
+        data_provenance=data_provenance,
+        split_hashes=split_hashes,
+        parameters=sum(p.numel() for p in model.parameters()),
+        torch_version=str(torch.__version__),
+        numpy_version=np.__version__,
+        python=sys.version,
+        package_versions={
+            name: importlib.metadata.version(name)
+            for name in ("torch", "numpy", "scipy", "h5py", "nibabel", "ml-collections")
+        },
+        device=str(device),
+        gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        amp_dtype=str(amp_dtype),
+        total_optimizer_updates=total_updates,
+    )
+    write_json(directory / "config.json", config_record)
+    logger.info(
+        "Device %s | AMP %s | parameters %s | train/val slices %d/%d | effective batch <= %d",
+        device,
+        amp_dtype,
+        f"{config_record['parameters']:,}",
+        len(datasets[0]),
+        len(datasets[1]),
+        args.batch_size * args.accum_steps,
+    )
+    logger.info(
+        "Selection: validation pixel-pooled mean foreground Dice; early stopping %s",
+        f"patience={args.patience}" if args.patience else "disabled (fixed ablation budget)",
+    )
+    writer = step_writer = None
+    if args.tensorboard:
         try:
-            # 1. Save to run_dir / logs / training_history.json
-            log_json = self.logs_dir / "training_history.json"
-            log_json.write_text(json.dumps(self.history, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            from torch.utils.tensorboard import SummaryWriter
 
-            # 2. Save to run_dir / training_history.json
-            root_json = self.run_dir / "training_history.json"
-            root_json.write_text(json.dumps(self.history, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-
-            # 3. Save CSV version
-            if self.history:
-                df = pd.DataFrame(self.history)
-                df.to_csv(self.logs_dir / "training_history.csv", index=False)
-                df.to_csv(self.run_dir / "training_history.csv", index=False)
-        except Exception as e:
-            logger.warning("Could not save training history: %s", e)
-
-    def fit(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        *,
-        epochs: int,
-        early_stopping_cfg: dict | None = None,
-    ) -> list[dict[str, Any]]:
-        es_cfg = early_stopping_cfg or {}
-        monitor_metric = es_cfg.get("monitor", "val_loss")
-        monitor_mode = es_cfg.get("mode", "min" if "loss" in monitor_metric else "max")
-
-        stopper = (
-            EarlyStopping(
-                patience=int(es_cfg.get("patience", 30)),
-                min_delta=float(es_cfg.get("min_delta", 1e-4)),
-                mode=monitor_mode,
+            writer = SummaryWriter(
+                str(directory / "tensorboard" / "epochs"),
+                purge_step=start_epoch + 1 if args.resume else None,
             )
-            if es_cfg.get("enabled", True)
-            else None
-        )
-
-        best_scar_dice = -1.0
-        best_mean_dice = -1.0
-        best_val_loss = math.inf
-
-        for epoch in range(1, epochs + 1):
-            train_loss = self._train_epoch(train_loader)
-            val_loss, val_metrics = self._validate_epoch(val_loader)
-
-            scar_dice_str = f"  dice_scar={val_metrics.get('dice_scar', float('nan')):.4f}" if "dice_scar" in val_metrics else ""
-            mean_dice_str = f"  mean_dice={val_metrics.get('mean_dice', float('nan')):.4f}" if "mean_dice" in val_metrics else ""
-
-            logger.info(
-                "Epoch %3d/%3d — train_loss=%.4f  val_loss=%.4f%s%s",
-                epoch,
-                epochs,
-                train_loss,
-                val_loss,
-                scar_dice_str,
-                mean_dice_str,
+            step_writer = SummaryWriter(
+                str(directory / "tensorboard" / "updates"),
+                purge_step=global_step + 1 if args.resume else None,
             )
+        except ImportError:
+            logger.warning("TensorBoard unavailable; CSV, JSONL and text logging remain enabled.")
 
-            row: dict[str, Any] = {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                **val_metrics,
+    stop_epoch = min(args.max_epochs, start_epoch + args.epochs_per_run) if args.epochs_per_run else args.max_epochs
+    try:
+        if args.patience and bad_epochs >= args.patience:
+            logger.info("Checkpoint already satisfied early stopping; no additional updates.")
+            return {"best_score": best_score, "best_epoch": best_epoch, "global_step": global_step}
+        for epoch in range(start_epoch, stop_epoch):
+            epoch_started = time.perf_counter()
+            lr_start = optimizer.param_groups[0]["lr"]
+            train_metrics, global_step = run_epoch(
+                model,
+                trainloader,
+                criterion,
+                device,
+                amp_dtype,
+                optimizer,
+                scaler,
+                scheduler,
+                args.accum_steps,
+                args.clip_grad,
+                args.log_every,
+                logger,
+                step_writer,
+                global_step,
+            )
+            val_metrics, _ = run_epoch(
+                model,
+                valloader,
+                criterion,
+                device,
+                amp_dtype,
+                log_every=args.log_every,
+                logger=logger,
+            )
+            score = val_metrics["mean_dice"]
+            if not math.isfinite(score):
+                raise ValueError("Validation foreground Dice undefined: check labels and held-out patients.")
+            meaningful = score > patience_score + args.min_delta
+            improved = score > best_score
+            bad_epochs = 0 if meaningful else bad_epochs + 1
+            if meaningful:
+                patience_score = score
+            if improved:
+                best_score, best_epoch = score, epoch
+            early_stop = bool(args.patience and bad_epochs >= args.patience)
+            record = {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "lr_start": lr_start,
+                "lr_next": optimizer.param_groups[0]["lr"],
+                "best_val_dice": best_score,
+                "best_epoch": best_epoch + 1,
+                "bad_epochs": bad_epochs,
+                "early_stop": early_stop,
+                "epoch_compute_seconds": time.perf_counter() - epoch_started,
             }
-            self.history.append(row)
-
-            # 1. Track best loss
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_checkpoint("best_loss", epoch, val_loss, val_metrics)
-
-            # 2. Track best model for views with Scar (SAX, 2CH, 4CH)
-            has_scar = "dice_scar" in val_metrics and not np.isnan(val_metrics["dice_scar"])
-            if has_scar:
-                current_scar_dice = val_metrics["dice_scar"]
-                if current_scar_dice > best_scar_dice:
-                    best_scar_dice = current_scar_dice
-                    self.save_checkpoint("best_scar_dice", epoch, val_loss, val_metrics)
-                    self.save_checkpoint("best", epoch, val_loss, val_metrics)
-
-            # 3. Track best model for views without Scar (e.g. RAS) using mean_dice
-            current_mean_dice = val_metrics.get("mean_dice", -1.0)
-            if not has_scar and not np.isnan(current_mean_dice) and current_mean_dice > best_mean_dice:
-                best_mean_dice = current_mean_dice
-                self.save_checkpoint("best_mean_dice", epoch, val_loss, val_metrics)
-                self.save_checkpoint("best", epoch, val_loss, val_metrics)
-
-            # 4. Always save latest checkpoint
-            self.save_checkpoint("last", epoch, val_loss, val_metrics)
-
-            # 5. If best.pt still doesn't exist (e.g. epoch 1 all dices were 0), save best.pt from best_loss
-            if not (self.checkpoint_dir / "best.pt").exists():
-                self.save_checkpoint("best", epoch, val_loss, val_metrics)
-
-            # 6. If view has scar, ensure best_scar_dice.pt is initialized
-            if self.view in ("SAX", "2CH", "4CH") and not (self.checkpoint_dir / "best_scar_dice.pt").exists():
-                self.save_checkpoint("best_scar_dice", epoch, val_loss, val_metrics)
-
-            # Save training history per epoch
-            self._save_history()
-
-            if stopper is not None:
-                eval_val = val_loss if monitor_metric == "val_loss" else val_metrics.get(monitor_metric, float("nan"))
-                if stopper.step(eval_val):
-                    logger.info("Early stopping triggered at epoch %d.", epoch)
-                    break
-
-        self._save_history()
-        return self.history
-
-
-# Alias for backwards compatibility
-LgeTrainer = Trainer
+            record.update({f"train/{key}": value for key, value in train_metrics.items()})
+            record.update({f"val/{key}": value for key, value in val_metrics.items()})
+            payload = dict(
+                format_version=1,
+                class_names=CLASS_NAMES,
+                model_config=model_config,
+                model=model.state_dict(),
+                optimizer=optimizer.state_dict(),
+                scheduler=scheduler.state_dict(),
+                scaler=scaler.state_dict(),
+                epoch=epoch,
+                global_step=global_step,
+                total_updates=total_updates,
+                best_score=best_score,
+                best_epoch=best_epoch,
+                bad_epochs=bad_epochs,
+                patience_score=patience_score,
+                args=vars(args),
+                data_provenance=data_provenance,
+                split_hashes=split_hashes,
+                rng=rng_state(),
+                loader_rng=generator.get_state(),
+            )
+            checkpoint_started = time.perf_counter()
+            if improved:
+                atomic_checkpoint(directory / "best.pth", payload)
+                logger.info(
+                    "New best checkpoint: epoch %d, validation Dice %.5f -> %s",
+                    epoch + 1,
+                    score,
+                    directory / "best.pth",
+                )
+            # Publish the recovery point after best, so a crash cannot advance
+            # the saved best_score while leaving best.pth missing or stale.
+            atomic_checkpoint(directory / "last.pth", payload)
+            if args.save_every and (epoch + 1) % args.save_every == 0:
+                atomic_checkpoint(directory / f"epoch_{epoch + 1:04d}.pth", payload)
+            record["checkpoint_seconds"] = time.perf_counter() - checkpoint_started
+            record["epoch_seconds"] = time.perf_counter() - epoch_started
+            with (directory / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(json_safe(record), allow_nan=False) + "\n")
+            csv_path = directory / "metrics.csv"
+            new_csv = not csv_path.exists() or csv_path.stat().st_size == 0
+            with csv_path.open("a", newline="", encoding="utf-8") as stream:
+                csv_writer = csv.DictWriter(stream, fieldnames=list(record))
+                if new_csv:
+                    csv_writer.writeheader()
+                csv_writer.writerow(json_safe(record))
+            if writer:
+                for key, value in record.items():
+                    if isinstance(value, (float, int)) and math.isfinite(value):
+                        writer.add_scalar(key, value, epoch + 1)
+                writer.flush()
+            logger.info(
+                "Epoch %d/%d | train %.5f val %.5f | val Dice %.5f IoU %.5f | lr %.3g | %.1fs | peak GPU %.0f MiB",
+                epoch + 1,
+                args.max_epochs,
+                train_metrics["loss"],
+                val_metrics["loss"],
+                score,
+                val_metrics["mean_iou"],
+                lr_start,
+                record["epoch_seconds"],
+                train_metrics["gpu_peak_allocated_mb"],
+            )
+            write_json(directory / "summary.json", record)
+            if early_stop:
+                logger.info("Early stopping after %d validation epochs without sufficient improvement.", bad_epochs)
+                break
+    except BaseException:
+        logger.exception("Training interrupted/failed; last.pth contains the last completed epoch if available.")
+        raise
+    finally:
+        if writer:
+            writer.close()
+        if step_writer:
+            step_writer.close()
+    return {"best_score": best_score, "best_epoch": best_epoch, "global_step": global_step}

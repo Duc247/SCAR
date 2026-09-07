@@ -1,251 +1,218 @@
-"""Entry point: train a multi-view LGE segmentation model with reproducible seed determinism.
-
-Usage:
-    python training/train.py \
-        --config training/config/models/unet_3d.yaml \
-        --run-id unet3d_lge_sax_exp01
-"""
-
+"""Train the prompt-free M0-M3 ablations (hierarchical YAML configuration & CLI)."""
 from __future__ import annotations
 
 import argparse
-import logging
-import os
-import random
-import shutil
-import sys
+import copy
+import math
 from pathlib import Path
+import sys
 
-import numpy as np
-import pandas as pd
 import torch
-import yaml
 
-# Make repo root importable
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.dataset.lge_dataset import LgeLaxDataset, LgeSaxDataset
-from training.dataset.sampler import build_rare_class_sampler
-from training.loss import build_loss
-from training.models import build_model
-from training.trainer.trainer import Trainer
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    datefmt="%H:%M:%S",
+from training.config.config_utils import (
+    coerce_config_to_parser_types,
+    flatten_config,
+    generate_run_dir,
+    load_merged_config,
 )
-logger = logging.getLogger(__name__)
+from training.models.cmspa_net import CONFIGS, CMSPANet
+from training.trainer.trainer import Trainer, seed_everything
 
 
-def set_seed(seed: int) -> None:
-    """Ensure 100% deterministic reproducibility for scientific experiments."""
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        default="training/config/models/cmspa_net.yaml",
+        help="Path to model YAML config, or legacy config name: R50-ViT-B_16, testing",
+    )
+    parser.add_argument(
+        "--base-config",
+        default=str(PROJECT_ROOT / "training" / "config" / "base.yaml"),
+        help="Path to base YAML config",
+    )
+    parser.add_argument(
+        "--data-root",
+        "--data_root",
+        default="E:/STUDY/DATASET/MyoPS380/Processed_data",
+    )
+    parser.add_argument(
+        "--list-dir",
+        "--list_dir",
+        default=str(PROJECT_ROOT / "data" / "processed" / "splits"),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory; defaults to outputs/runs/{model_name}_{timestamp}",
+    )
+    parser.add_argument(
+        "--run-root",
+        default=str(PROJECT_ROOT / "outputs" / "runs"),
+        help="Root directory for automated timestamped runs",
+    )
+    parser.add_argument("--run-id", default=None, help="Named run directory under --run-root")
+    parser.add_argument("--ce-weight", type=float, default=0.5)
+    parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--sampler", choices=("none", "rare"), default="none")
+    parser.add_argument("--rare-boost", type=float, default=2.0)
+    parser.add_argument("--foreground-boost", type=float, default=1.3)
+    parser.add_argument("--ablation", choices=["M0", "M1", "M2", "M3"], default="M3")
+    parser.add_argument("--epochs", "--max_epochs", dest="max_epochs", type=int, default=300)
+    parser.add_argument(
+        "--batch-size",
+        "--batch_size",
+        dest="batch_size",
+        type=int,
+        default=16,
+        help="microbatch on one device",
+    )
+    parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--lr", "--base_lr", dest="base_lr", type=float, default=0.001)
+    parser.add_argument("--weight-decay", type=float, default=0.0001)
+    parser.add_argument("--img-size", "--img_size", dest="img_size", type=int, default=128)
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
+    parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"], default="auto")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="recompute encoder blocks to reduce activation memory",
+    )
+    parser.add_argument("--clip-grad", type=float, default=1.0)
+    parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=4)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.2,
+        help="held-out TRAIN patients if val.txt is absent",
+    )
+    parser.add_argument("--label-order", choices=["auto", "legacy", "canonical"], default="auto")
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help="0 disables early stopping; measured in validation epochs",
+    )
+    parser.add_argument("--min-delta", type=float, default=0.0, help="minimum Dice gain to reset patience")
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=0,
+        help="optional archival checkpoint cadence; best/last always saved",
+    )
+    parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="complete state from this pipeline; keep original training settings",
+    )
+    parser.add_argument("--pretrained", default=None, help="explicit R50-ViT-B_16.npz encoder initialization")
+    parser.add_argument(
+        "--epochs-per-run",
+        type=int,
+        default=0,
+        help="pause after N additional epochs while preserving the planned LR schedule",
+    )
+    return parser
 
 
-def merge_configs(base_path: Path, model_path: Path) -> dict:
-    """Load base config then override with model-specific config."""
-    base = yaml.safe_load(base_path.read_text(encoding="utf-8")) if base_path.exists() else {}
-    model_cfg = yaml.safe_load(model_path.read_text(encoding="utf-8"))
+def parse_args(argv=None):
+    """Resolve base YAML < model YAML < explicit CLI, without starting training."""
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="training/config/models/cmspa_net.yaml")
+    pre_parser.add_argument("--base-config", default=str(PROJECT_ROOT / "training/config/base.yaml"))
+    pre_args, _ = pre_parser.parse_known_args(argv)
+    config_name = pre_args.config
+    if config_name in CONFIGS:
+        config_name = "testing.yaml" if config_name == "testing" else "cmspa_net.yaml"
+    config_path = Path(config_name)
+    if not config_path.is_absolute() and (PROJECT_ROOT / config_path).is_file():
+        config_path = PROJECT_ROOT / config_path
+    merged = load_merged_config(config_path, pre_args.base_config)
+    parser = build_parser()
+    parser.set_defaults(**coerce_config_to_parser_types(flatten_config(merged), parser))
+    args = parser.parse_args(argv)
+    for key in ("max_epochs", "batch_size", "accum_steps", "img_size", "cpu_threads", "log_every"):
+        if getattr(args, key) < 1:
+            parser.error(f"{key} must be positive")
+    if args.img_size < 32 or args.img_size % 16:
+        parser.error("img_size must be a multiple of 16 and >=32")
+    if args.base_lr <= 0 or args.weight_decay < 0 or not 0 < args.val_fraction < 1:
+        parser.error("Require lr>0, weight_decay>=0, 0<val_fraction<1")
+    for key in ("base_lr", "weight_decay", "val_fraction", "min_delta", "clip_grad", "ce_weight", "dice_weight"):
+        if not math.isfinite(getattr(args, key)):
+            parser.error(f"{key} must be finite")
+    for key in ("num_workers", "patience", "min_delta", "save_every", "epochs_per_run", "clip_grad", "ce_weight", "dice_weight"):
+        if getattr(args, key) < 0:
+            parser.error(f"{key} must be nonnegative")
+    if args.ce_weight + args.dice_weight <= 0:
+        parser.error("At least one loss weight must be positive")
+    if any(not math.isfinite(v) or v <= 0 for v in (args.rare_boost, args.foreground_boost)):
+        parser.error("Sampler weights must be finite and positive")
+    if args.resume and args.pretrained:
+        parser.error("--resume and --pretrained are mutually exclusive")
+    if args.run_id and (args.run_id in {".", ".."} or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in args.run_id)):
+        parser.error("run-id may contain only letters, digits, dots, underscores, and hyphens")
+    if args.run_id and args.output_dir not in (None, "auto"):
+        parser.error("Use either --run-id or --output-dir")
+    if merged["model"].get("num_classes", 4) != 4:
+        parser.error("This data contract requires four canonical classes")
+    return args, merged
 
-    def deep_merge(base_d: dict, override_d: dict) -> dict:
-        result = dict(base_d)
-        for key, value in override_d.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = deep_merge(result[key], value)
-            else:
-                result[key] = value
-        return result
 
-    return deep_merge(base, model_cfg)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train LGE segmentation model.")
-    parser.add_argument("--config", required=True, help="Path to model config YAML")
-    parser.add_argument("--run-id", required=True, help="Unique run identifier")
-    parser.add_argument("--base-config", default="training/config/base.yaml")
-    args = parser.parse_args()
-
-    config = merge_configs(ROOT / args.base_config, ROOT / args.config)
-    seed = int(config.get("seed", 42))
-    set_seed(seed)
-    logger.info("Deterministic seed set to: %d", seed)
-
-    # Device
-    req_device = str(config.get("device", "auto")).lower()
-    if req_device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def main(argv=None):
+    args, merged = parse_args(argv)
+    for key in ("data_root", "list_dir"):
+        path = Path(getattr(args, key)).resolve()
+        if not path.is_dir():
+            raise FileNotFoundError(f"{key} directory does not exist: {path}")
+        setattr(args, key, str(path))
+    if args.output_dir in (None, "auto"):
+        if args.run_id:
+            output = Path(args.run_root) / args.run_id
+        elif args.resume:
+            output = Path(args.resume).resolve().parent
+        else:
+            output = generate_run_dir(args.run_root, merged["model"].get("model_name", "CMSPA-Net"))
     else:
-        device = torch.device(req_device)
-    logger.info("Using device: %s", device)
-
-    # Run directory
-    run_dir = ROOT / config.get("outputs", {}).get("run_root", "outputs/runs") / args.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Snapshot config
-    (run_dir / "config_snapshot.yaml").write_text(
-        yaml.dump(config, allow_unicode=True), encoding="utf-8"
-    )
-
-    # Load splits
-    splits_dir = ROOT / config["data"]["splits_dir"]
-    train_df = pd.read_csv(splits_dir / "train.csv")
-    val_df = pd.read_csv(splits_dir / "validation.csv")
-
-    view = str(config.get("view", "SAX")).upper()
-    train_df = train_df[train_df["view"] == view]
-    val_df = val_df[val_df["view"] == view]
-    logger.info("Dataset filtered: Train=%d, Val=%d (View=%s)", len(train_df), len(val_df), view)
-
-    # Preprocessing params
-    pp = config.get("preprocessing", {})
-    target_shape = tuple(pp["target_shape"])
-    target_spacing = tuple(pp["target_spacing"])
-    percentiles = tuple(pp["intensity_percentiles"]) if pp.get("intensity_percentiles") else None
-
-    # Cache dir (optional fast loading)
-    cache_dir = ROOT / config["data"].get("cache_dir", "data/processed/cache")
-    raw_root = ROOT / config["data"]["raw_root"]
-
-    is_3d_model = str(config.get("model_name", "")).lower() == "unet_3d" or len(target_shape) == 3
-    DatasetClass = LgeSaxDataset if is_3d_model else LgeLaxDataset
-    in_channels = int(config.get("training", {}).get("in_channels", config.get("model", {}).get("in_channels", 1)))
-    ds_kwargs = {}
-    if not is_3d_model:
-        ds_kwargs["in_channels"] = in_channels
-
-    train_ds = DatasetClass(
-        records=train_df,
-        data_root=raw_root,
-        cache_dir=cache_dir if cache_dir.exists() else None,
-        target_shape=target_shape,
-        target_spacing=target_spacing,
-        intensity_percentiles=percentiles,
-        augment=bool(config.get("training", {}).get("augment", True)),
-        **ds_kwargs,
-    )
-    val_ds = DatasetClass(
-        records=val_df,
-        data_root=raw_root,
-        cache_dir=cache_dir if cache_dir.exists() else None,
-        target_shape=target_shape,
-        target_spacing=target_spacing,
-        intensity_percentiles=percentiles,
-        augment=False,
-        **ds_kwargs,
-    )
-
-    # Sampler
-    sampler_cfg = config.get("training", {}).get("sampler", {})
-    use_sampler = bool(sampler_cfg.get("enabled", False))
-    sampler = None
-    if use_sampler:
-        sampler = build_rare_class_sampler(
-            train_ds,
-            rare_classes=sampler_cfg.get("rare_classes", [3, 2]),
-            rare_boost=float(sampler_cfg.get("rare_boost", 2.5)),
-            foreground_boost=float(sampler_cfg.get("foreground_boost", 1.5)),
-        )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_size=int(config["training"]["batch_size"]),
-        shuffle=(sampler is None),
-        sampler=sampler,
-        num_workers=int(config["data"].get("num_workers", 0)),
-        pin_memory=bool(config["data"].get("pin_memory", False)),
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=int(config["data"].get("num_workers", 0)),
-    )
-
-    # Model
-    num_classes = int(config.get("num_classes", 5))
-    model_kwargs = dict(config.get("model", {}))
-    model_kwargs["num_classes"] = num_classes
-    if "in_channels" not in model_kwargs and not is_3d_model:
-        model_kwargs["in_channels"] = in_channels
-
-    model = build_model(
-        config["model_name"],
-        **model_kwargs,
-    ).to(device)
-
-    # Optimizer & Scheduler
-    lr = float(config["training"]["learning_rate"])
-    wd = float(config["training"].get("weight_decay", 0.01))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-
-    epochs = int(config["training"]["epochs"])
-    sched_cfg = config.get("training", {}).get("scheduler", {})
-    min_lr = float(sched_cfg.get("min_lr", 1e-6))
-    warmup_epochs = int(sched_cfg.get("warmup_epochs", 0))
-
-    if warmup_epochs > 0 and epochs > warmup_epochs:
-        warmup_sched = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
-        )
-        main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs - warmup_epochs, eta_min=min_lr
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup_sched, main_sched], milestones=[warmup_epochs]
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
-
-    # Loss
-    loss_cfg = config.get("loss", {})
-    loss_name = loss_cfg.get("name", "one_vs_rest_compound")
-    loss_kwargs = {
-        "num_classes": num_classes,
-        "ce_weight": float(loss_cfg.get("ce_weight", 1.0)),
-        "dice_weight": float(loss_cfg.get("dice_weight", 1.0)),
-        "bce_weight": float(loss_cfg.get("bce_weight", 0.5)),
-        "focal_weight": float(loss_cfg.get("focal_weight", 1.0)),
-        "focal_gamma": float(loss_cfg.get("focal_gamma", 2.0)),
-        "pos_weight": loss_cfg.get("pos_weight", None),
-        "class_weights": loss_cfg.get("class_weights", None),
-        "alpha": float(loss_cfg.get("alpha", 0.3)),
-        "beta": float(loss_cfg.get("beta", 0.7)),
-        "gamma": float(loss_cfg.get("gamma", 1.33)),
-    }
-    loss_fn = build_loss(loss_name, **loss_kwargs)
-
-    # Trainer
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        loss_fn=loss_fn,
-        device=device,
-        run_dir=run_dir,
-        config=config,
-        num_classes=num_classes,
-        view=view,
-    )
-
-    logger.info("Starting training run '%s' for %d epochs...", args.run_id, epochs)
-    trainer.fit(
-        train_loader,
-        val_loader,
-        epochs=epochs,
-        early_stopping_cfg=config["training"].get("early_stopping"),
-    )
-    logger.info("Training complete. Artifacts saved to %s", run_dir)
+        output = Path(args.output_dir)
+    output = output.resolve()
+    if not args.resume and output.exists() and any(output.iterdir()):
+        raise FileExistsError("Run directory is not empty; choose a new run-id or use --resume")
+    if args.resume:
+        if Path(args.resume).resolve().parent != output or Path(args.resume).name != "last.pth":
+            raise ValueError("Resume from last.pth into its original run directory")
+    args.output_dir = str(output)
+    section = merged["model"]
+    config = copy.deepcopy(CONFIGS["R50-ViT-B_16"])
+    config.resnet.num_layers = tuple(section["resnet"]["num_layers"])
+    config.resnet.width_factor = float(section["resnet"]["width_factor"])
+    config.transformer.dropout_rate = float(section.get("transformer", {}).get("dropout_rate", 0.1))
+    for key in ("decoder_channels", "skip_channels", "fused_channels", "n_skip", "cross_attention_heads", "classifier", "activation"):
+        if key in section:
+            config[key] = tuple(section[key]) if key == "decoder_channels" else section[key]
+    config.ablation = args.ablation
+    config.gradient_checkpointing = args.gradient_checkpointing
+    config.n_classes = 4
+    torch.set_num_threads(args.cpu_threads)
+    seed_everything(args.seed, args.deterministic)
+    model = CMSPANet(config, img_size=args.img_size, num_classes=4, ablation=args.ablation)
+    if args.pretrained:
+        model.load_pretrained_encoders(args.pretrained)
+    return Trainer(model, args, output).fit()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,10 @@ outputs/
 *.pt
 *.pth
 *.npz
+*.npy
+*.h5
+*.nii
+*.nii.gz
 
 # ==============================================================================
 # Python & Bytecode
@@ -31,6 +35,7 @@ env/
 # Testing, Agent Logs & Code Coverage
 # ==============================================================================
 .pytest_cache/
+tmp/
 .coverage
 htmlcov/
 .agents/

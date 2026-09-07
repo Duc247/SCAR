@@ -1,8 +1,9 @@
-# train.ps1 - PowerShell 1-Click Runner for Windows
-param (
-    [string]$Config = "training/config/models/unet_3d.yaml",
-    [string]$RunId = "unet3d_lge_sax_exp01"
-)
-
-Write-Host ">>> Starting 1-Click LGE Training Pipeline on Windows PowerShell..." -ForegroundColor Green
-python run_all.py --config $Config --run-id $RunId
+# Arguments are forwarded unchanged, e.g. .\train.ps1 --run-id m3_run01 --skip-cache
+$ErrorActionPreference = 'Stop'
+Push-Location $PSScriptRoot
+try {
+    & python run_all.py @args
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally {
+    Pop-Location
+}

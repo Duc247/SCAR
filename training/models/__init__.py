@@ -1,28 +1,72 @@
-"""Model registry and factory for LGE segmentation."""
-
+"""Model architectures and model registry."""
 from __future__ import annotations
 
-from typing import Any
-import torch.nn as nn
+from functools import partial
+from typing import Callable
 
-from training.models.unet_3d import UNet3D
-from training.models.unet_2d import UNet2D
-from training.models.resunet_plus_plus import ResUNetPlusPlus2D, MultiDatasetResUNetPlusPlus
+from torch import nn
 
-MODEL_REGISTRY: dict[str, type[nn.Module]] = {
-    "unet_3d": UNet3D,
-    "unet_2d": UNet2D,
-    "resunet_plus_plus": ResUNetPlusPlus2D,
-    "resunet_plus_plus_2d": ResUNetPlusPlus2D,
-    "resunet_plus_plus_multihead": MultiDatasetResUNetPlusPlus,
+from training.models.backbones.resnet_v2 import PreActBottleneck, ResNetV2, StdConv2d
+from training.models.cmspa_net import (
+    CONFIGS,
+    CMSPANet,
+    Embeddings,
+    Transformer,
+    VisionTransformer,
+    get_config,
+    get_r50_b16_config,
+    get_r50_l16_config,
+    get_testing,
+)
+from training.models.modules.cmspa import CMSPA_Fusion
+from training.models.modules.decoder import DecoderCup, SegmentationHead
+from training.models.modules.fusion import ConcatFusion, CrossAttention_Fusion, Fusion_Embed
+from training.models.modules.sspanet import SSPANet_Block
+
+MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
+    "cmspa_net": CMSPANet,
+    "cmspa": CMSPANet,
+    "vision_transformer": CMSPANet,
+    "concat_baseline": partial(CMSPANet, ablation="M0"),
+    "sspanet_baseline": partial(CMSPANet, ablation="M1"),
+    "cross_attn_baseline": partial(CMSPANet, ablation="M2"),
 }
 
 
-def build_model(model_name: str, **kwargs: Any) -> nn.Module:
-    """Build model instance by name from registry."""
-    if model_name not in MODEL_REGISTRY:
+def build_model(model_name: str, **kwargs) -> nn.Module:
+    """Instantiate a registered model by name."""
+    name = model_name.lower().replace("-", "_")
+    if name not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model '{model_name}'. Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model '{model_name}'. Available models: {list(MODEL_REGISTRY.keys())}"
         )
-    return MODEL_REGISTRY[model_name](**kwargs)
+    expected = {"concat_baseline": "M0", "sspanet_baseline": "M1",
+                "cross_attn_baseline": "M2"}.get(name)
+    if expected is not None and kwargs.get("ablation", expected).upper() != expected:
+        raise ValueError(f"Model {model_name!r} requires ablation {expected}")
+    return MODEL_REGISTRY[name](**kwargs)
 
+
+__all__ = [
+    "CMSPANet",
+    "VisionTransformer",
+    "CONFIGS",
+    "get_config",
+    "get_r50_b16_config",
+    "get_r50_l16_config",
+    "get_testing",
+    "Embeddings",
+    "Transformer",
+    "ResNetV2",
+    "StdConv2d",
+    "PreActBottleneck",
+    "SSPANet_Block",
+    "CMSPA_Fusion",
+    "ConcatFusion",
+    "CrossAttention_Fusion",
+    "Fusion_Embed",
+    "DecoderCup",
+    "SegmentationHead",
+    "MODEL_REGISTRY",
+    "build_model",
+]

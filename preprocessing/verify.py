@@ -1,83 +1,51 @@
-"""Quick sanity check: load a few LGE NIfTI files and run preprocessing.
-
-Usage:
-    python preprocessing/verify.py \
-        --data-root data/LGE_MULTI \
-        --config preprocessing/config.yaml \
-        --n 3
-"""
-
+"""Validate MyoPS labels, synchronized modalities, splits and declared geometry."""
 from __future__ import annotations
-
 import argparse
+import json
 from pathlib import Path
-
-import nibabel as nib
-import numpy as np
-import yaml
-
 import sys
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from preprocessing.preprocessing import MODALITIES
+from training.dataset.data_contract import read_split_names, validate_patient_splits, patient_id
+from training.dataset.myops_dataset import MyopsDataset
 
-from preprocessing.preprocessing import preprocess_mask, preprocess_spatial
+
+def verify_dataset(data_root, list_dir, label_order="auto"):
+    splits = {s: read_split_names(list_dir, s) for s in ("train", "val", "test_vol")}
+    patients = validate_patient_splits(splits)
+    if not all(splits.values()):
+        raise ValueError("All train/val/test splits must be nonempty")
+    volumes = read_split_names(list_dir, "val_vol")
+    if set(volumes) != {patient_id(n) for n in splits["val"]}:
+        raise ValueError("Validation volume IDs differ from validation patients")
+    counts, with_mm, total = {}, 0, 0
+    for split in ("train", "val", "val_vol", "test_vol"):
+        folder = split + "_h5" if split.endswith("vol") else "train_npz"
+        roots = [Path(data_root) / m / folder for m in MODALITIES]
+        dataset = MyopsDataset(*roots, list_dir, split, label_order=label_order)
+        for sample in dataset:
+            with_mm += int(sample["has_geometry"])
+            total += 1
+        counts[split] = len(dataset)
+    result = {"status": "passed", "sample_counts": counts,
+              "patient_counts": {k: len(v) for k, v in patients.items()},
+              "samples_with_mm_geometry": with_mm,
+              "samples_without_mm_geometry": total - with_mm,
+              "geometry_note": "Unknown units remain unknown. HD95 mm requires physical metadata."}
+    return result
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", default="data/LGE_MULTI")
-    parser.add_argument("--config", default="preprocessing/config.yaml")
-    parser.add_argument("--view", default="SAX", choices=["SAX", "2CH", "4CH", "RAS"])
-    parser.add_argument("--n", type=int, default=3, help="Number of files to verify")
-    args = parser.parse_args()
-
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    view_key = "sax" if args.view == "SAX" else "lax"
-    pp = cfg["lge_preprocessing"][view_key]
-
-    target_shape = tuple(pp["target_shape"])
-    target_spacing = tuple(pp["target_spacing"])
-    percentiles = tuple(pp["intensity_percentiles"]) if pp["intensity_percentiles"] else None
-
-    data_root = Path(args.data_root).resolve()
-    image_files = sorted(data_root.rglob(f"*{args.view}_TR/image/*.nii*"))[: args.n]
-
-    if not image_files:
-        print(f"Không tìm thấy file ảnh nào trong {data_root} cho view {args.view}")
-        return
-
-    for img_path in image_files:
-        nii = nib.as_closest_canonical(nib.load(str(img_path)))
-        image = np.asanyarray(nii.dataobj)
-        spacing = tuple(float(v) for v in nii.header.get_zooms()[: len(target_shape)])
-
-        processed, transform = preprocess_spatial(
-            image,
-            source_spacing=spacing,
-            target_spacing=target_spacing,
-            target_shape=target_shape,
-            interpolation_order=1,
-            intensity_percentiles=percentiles,
-        )
-        print(
-            f"  {img_path.name}: {image.shape} {spacing} mm"
-            f"  →  {processed.shape}  min={processed.min():.3f}  max={processed.max():.3f}"
-        )
-
-        # Check label if available
-        label_path = img_path.parent.parent / "anno" / img_path.name
-        if label_path.exists():
-            label_nii = nib.as_closest_canonical(nib.load(str(label_path)))
-            label = np.rint(np.asanyarray(label_nii.dataobj)).astype(np.int16)
-            label_proc = preprocess_mask(
-                label,
-                source_spacing=spacing,
-                target_spacing=target_spacing,
-                target_shape=target_shape,
-            )
-            print(f"    label unique values: {sorted(np.unique(label_proc).tolist())}")
-
-    print("\nSanity check PASSED.")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", default="E:/STUDY/DATASET/MyoPS380/Processed_data")
+    parser.add_argument("--list-dir", default=str(ROOT / "data/processed/splits"))
+    parser.add_argument("--label-order", choices=("auto", "legacy", "canonical"), default="auto")
+    result = verify_dataset(**vars(parser.parse_args(argv)))
+    print(json.dumps(result, indent=2))
+    return result
 
 
 if __name__ == "__main__":

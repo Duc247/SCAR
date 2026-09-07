@@ -1,0 +1,23 @@
+# Lightweight smoke test configuration for fast CPU test suites
+model:
+  model_name: Testing-Small
+  ablation: M3
+  img_size: 32
+  resnet:
+    num_layers: [1, 1, 1]
+    width_factor: 0.5
+  decoder_channels: [64, 32, 16, 8]
+  skip_channels: [256, 128, 32, 0]
+  fused_channels: 64
+  transformer:
+    dropout_rate: 0.0
+
+train:
+  epochs: 2
+  batch_size: 2
+  accum_steps: 2
+  lr: 0.001
+  log_every: 1
+
+data:
+  num_workers: 0

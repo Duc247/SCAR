@@ -1,0 +1,152 @@
+"""Shared label semantics and reproducible, patient-disjoint split manifests."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+
+import numpy as np
+
+CLASS_NAMES = ("background", "normal_myocardium", "edema", "scar")
+CANONICAL_LABEL_ORDER = "background_normal_edema_scar"
+LEGACY_LABEL_ORDER = "background_normal_scar_edema"
+LABEL_ORDERS = {
+    "canonical": CANONICAL_LABEL_ORDER,
+    "legacy": LEGACY_LABEL_ORDER,
+    CANONICAL_LABEL_ORDER: CANONICAL_LABEL_ORDER,
+    LEGACY_LABEL_ORDER: LEGACY_LABEL_ORDER,
+}
+
+
+def resolve_label_order(value):
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        return LABEL_ORDERS[str(value)]
+    except KeyError as exc:
+        raise ValueError(f"Unknown label order {value!r}; use canonical or legacy.") from exc
+
+
+def canonicalize_label(label, label_order):
+    """Convert 0..3 class IDs once, never mutate the source array."""
+    label = np.asarray(label)
+    if not np.isfinite(label).all() or not np.equal(label, np.round(label)).all():
+        raise ValueError("Segmentation masks must contain finite integer class IDs.")
+    if label.size == 0 or label.min() < 0 or label.max() > 3:
+        raise ValueError(f"Expected class IDs 0..3; found {np.unique(label).tolist()}.")
+    result = label.astype(np.uint8, copy=True)
+    if resolve_label_order(label_order) == LEGACY_LABEL_ORDER:
+        result = np.asarray([0, 1, 3, 2], dtype=np.uint8)[result]
+    return result
+
+
+def patient_id(sample_name):
+    """Released layout uses caseXXXX_sliceNNN or caseXXXX volume IDs."""
+    name = str(sample_name).strip()
+    for extension in (".npy.h5", ".nii.gz", ".npz", ".h5", ".nii"):
+        if name.endswith(extension):
+            name = name[:-len(extension)]
+            break
+    if not name or name in {".", ".."} or any(c in name for c in ("/", "\\", ":")):
+        raise ValueError(f"Invalid sample name {sample_name!r}; manifests must contain basenames.")
+    return re.sub(r"_slice\d+$", "", name)
+
+
+def read_split_names(list_dir, split):
+    path = Path(list_dir) / f"{split}.txt"
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing split manifest: {path}")
+    names = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    if len(names) != len(set(names)):
+        raise ValueError(f"Duplicate samples in {path}; regenerate manifests without append mode.")
+    for name in names:
+        patient_id(name)
+        if Path(name).suffix:
+            raise ValueError(f"Split manifests use IDs without file extensions: {name!r} in {path}")
+    return names
+
+
+def validate_patient_splits(splits):
+    """Reject sample duplication and all cross-split patient overlap."""
+    patient_sets = {}
+    for split, names in splits.items():
+        if len(names) != len(set(names)):
+            raise ValueError(f"Duplicate samples in {split} split.")
+        patient_sets[split] = {patient_id(name) for name in names}
+    keys = list(patient_sets)
+    for i, left in enumerate(keys):
+        for right in keys[i + 1:]:
+            overlap = patient_sets[left] & patient_sets[right]
+            if overlap:
+                raise ValueError(f"Patient leakage between {left} and {right}: {sorted(overlap)[:10]}")
+    return patient_sets
+
+
+def _write_manifest(path, names):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("".join(f"{name}\n" for name in names), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _validate_volume_validation(list_dir, validation_names):
+    if not (Path(list_dir) / "val_vol.txt").is_file():
+        return None
+    volumes = read_split_names(list_dir, "val_vol")
+    if set(volumes) != {patient_id(name) for name in validation_names}:
+        raise ValueError("val_vol patient IDs must exactly match the held-out val slice patients.")
+    return volumes
+
+
+def ensure_patient_splits(list_dir, val_fraction=0.2, seed=42, output_dir=None):
+    """Return manifests with train/val NPZ IDs and unchanged test IDs.
+
+    Hold out whole training patients only when val.txt does not already exist.
+    A complete output directory is validated and reused, making resume stable.
+    Use an experiment output_dir to keep original dataset manifests untouched.
+    """
+    source = Path(list_dir)
+    destination = Path(output_dir) if output_dir is not None else source
+    if all((destination / f"{s}.txt").is_file() for s in ("train", "val", "test_vol")):
+        splits = {s: read_split_names(destination, s) for s in ("train", "val", "test_vol")}
+        validate_patient_splits(splits)
+        _validate_volume_validation(destination, splits["val"])
+        if not splits["train"] or not splits["val"]:
+            raise ValueError("Both training and validation splits must be nonempty.")
+        return destination
+    train = read_split_names(source, "train")
+    test = read_split_names(source, "test_vol") if (source / "test_vol.txt").exists() else []
+    if (source / "val.txt").is_file():
+        val = read_split_names(source, "val")
+    else:
+        if not 0 < val_fraction < 1:
+            raise ValueError("val_fraction must be strictly between 0 and 1.")
+        patients = sorted({patient_id(name) for name in train})
+        if len(patients) < 2:
+            raise ValueError("At least two training patients are required for held-out validation.")
+        shuffled = np.random.default_rng(seed).permutation(patients)
+        count = min(len(patients) - 1, max(1, round(len(patients) * val_fraction)))
+        val_patients = set(shuffled[:count])
+        val = [name for name in train if patient_id(name) in val_patients]
+        train = [name for name in train if patient_id(name) not in val_patients]
+    splits = {"train": train, "val": val, "test_vol": test}
+    patients = validate_patient_splits(splits)
+    val_volumes = _validate_volume_validation(source, val)
+    if not train or not val:
+        raise ValueError("Both training and validation splits must be nonempty.")
+    for split, names in splits.items():
+        _write_manifest(destination / f"{split}.txt", names)
+    if val_volumes is not None:
+        _write_manifest(destination / "val_vol.txt", val_volumes)
+    metadata = {
+        "seed": seed,
+        "val_fraction_of_training_patients": val_fraction,
+        "source_list_dir": str(source.resolve()),
+        "patient_ids": {split: sorted(ids) for split, ids in patients.items()},
+        "sample_counts": {split: len(names) for split, names in splits.items()},
+    }
+    (destination / "split_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return destination
