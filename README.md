@@ -6,7 +6,7 @@
   </a>
   <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python" alt="Python Version">
   <img src="https://img.shields.io/badge/PyTorch-%E2%89%A52.3-ee4c2c?logo=pytorch" alt="PyTorch Version">
-  <img src="https://img.shields.io/badge/Tests-110%2F110%20Passed-brightgreen?logo=pytest" alt="Test Suite">
+  <img src="https://img.shields.io/badge/Task-CMR%20Segmentation-success" alt="Task">
   <img src="https://img.shields.io/badge/Architecture-CMSPA--Net%20(M3)-8A2BE2" alt="Model Architecture">
 </p>
 
@@ -35,7 +35,6 @@ Mô hình chủ lực **CMSPA-Net (M3)** kết hợp **3 encoder ResNetV2 độc
 - [🛠️ Cài đặt Môi trường](#️-cài-đặt-môi-trường)
 - [🏋️ Huấn luyện Mô hình](#️-huấn-luyện-mô-hình)
 - [📊 Đánh giá & Xuất kết quả NIfTI](#-đánh-giá--xuất-kết-quả-nifti)
-- [🧪 Kiểm thử & Xác thực Parity](#-kiểm-thử--xác-thực-parity)
 - [📂 Cấu trúc Repository](#-cấu-trúc-repository)
 - [📚 Tài liệu Tham khảo](#-tài-liệu-tham-khảo)
 
@@ -192,48 +191,36 @@ Báo cáo kết quả được lưu tại `outputs/runs/m3_run01/eval_test_vol/`
 
 ---
 
-## 🧪 Kiểm thử & Xác thực Parity
-
-Toàn bộ repository đã được kiểm thử nghiêm ngặt đạt **110 / 110 tests pass (100%)**:
-
-```bash
-# 1. Chạy toàn bộ bộ test
-python -m pytest tests -q
-
-# 2. Kiểm tra nhanh chu trình forward/backward/AdamW
-python tools/sanity_check.py --profile testing --device cuda --amp auto
-
-# 3. Đối soát parity toán học tuyệt đối với I_MMSeg (sai số 0.0)
-python tools/verify_parity.py --profile testing
-```
-
----
-
-## 📂 Cấu trúc Repository
+## 📂 Cấu trúc Repository (Đã Tinh Gọn)
 
 ```text
 SCAR/
-├── preprocessing/                # Xử lý NIfTI, chuẩn hóa cường độ, chia splits, verify
+├── data/                        # Dữ liệu splits (train.txt, val.txt, test_vol.txt)
+├── outputs/                     # Sơ đồ kiến trúc (figures/) và checkpoints huấn luyện (runs/)
+│   └── figures/                 # pipeline_cmspa_net.png (300 DPI) & pipeline_cmspa_net.pdf
+├── preprocessing/               # Pipeline tiền xử lý NIfTI, chuẩn hóa cường độ, chia splits
 │   ├── build_splits.py
+│   ├── config.yaml
+│   ├── preprocessing.py
 │   ├── process_and_save.py
-│   └── splits/test_vol.txt       # Danh sách 76 bệnh nhân test cố định
-├── training/
+│   ├── verify.py
+│   └── splits/test_vol.txt      # 76 ca test cố định
+├── training/                    # Toàn bộ mã nguồn mô hình & huấn luyện cốt lõi
 │   ├── config/                  # base.yaml và cấu hình models/ (M0 -> M3)
-│   ├── dataset/                 # Dataset reader, Data Contract, Sampler
-│   ├── models/                  # CMSPA-Net, backbones/ (ResNetV2), modules/
+│   ├── dataset/                 # Dataset loader, Data Contract, Sampler
 │   ├── loss/                    # DiceLoss, SegmentationLoss (AMP-safe)
 │   ├── metrics/                 # ConfusionMeter, SurfaceDistance (HD95, ASD)
-│   ├── trainer/                 # Trainer core, logging, checkpoints
+│   ├── models/                  # CMSPA-Net, backbones/ (ResNetV2), modules/ (SSPANet, CMSPA)
+│   ├── trainer/                 # Trainer core, logging, checkpoints, early stopping
 │   ├── train.py                 # Module train chính
 │   ├── evaluate.py              # Đánh giá 3D volume
 │   └── predict.py               # Dự đoán NIfTI
-├── tools/                       # Sanity check, Parity verification, Smoke test
-├── tests/                       # 5 bộ test chuyên sâu (110 passed)
+├── run_all.py                   # Script chạy tự động trọn gói (Build splits -> Train -> Eval)
+├── train.py                     # CLI huấn luyện nhanh
+├── test.py                      # CLI đánh giá nhanh
 ├── scar_pipeline.ipynb          # Notebook Google Colab hoàn chỉnh
-├── run_all.py                   # Script chạy tự động end-to-end
-├── train.py / test.py           # CLI entry points tương thích ngược
-├── requirements.txt             # Thư viện phụ thuộc
-└── README.md                    # Tài liệu hướng dẫn
+├── requirements.txt             # Danh sách thư viện phụ thuộc
+└── README.md                    # Tài liệu hướng dẫn sử dụng
 ```
 
 ---
