@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import csv
 import hashlib
 import json
@@ -18,10 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from training.dataset.data_contract import CLASS_NAMES, patient_id, read_split_names
+from training.dataset.data_contract import CLASS_NAMES, patient_id, read_split_names, lock_benchmark_data, resolve_label_order
 from training.dataset.myops_dataset import MyopsDataset, Myops_dataset
 from training.predict import predict_volume
-from training.metrics.surface_distance import binary_metrics
+from training.metrics.surface_distance import BENCHMARK_PROTOCOL, benchmark_rows, summarize_rows
 from training.models.cmspa_net import CMSPANet, VisionTransformer
 from training.trainer.trainer import (
     json_safe,
@@ -44,61 +43,26 @@ def build_parser():
     parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"], default="auto")
     parser.add_argument(
         "--label-order",
-        choices=["auto", "legacy", "canonical"],
+        choices=["legacy", "canonical"],
         default=None,
         help="default: checkpoint data convention",
     )
-    parser.add_argument(
-        "--spacing",
-        type=float,
-        nargs=3,
-        default=None,
-        metavar=("H_MM", "W_MM", "D_MM"),
-        help="explicit physical spacing for legacy files missing geometry",
-    )
     parser.add_argument("--save-predictions", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--allow-voxel-spacing", action="store_true",
-                        help="Report voxel HD95 separately when physical geometry is unknown")
     parser.add_argument("--cpu-threads", type=int, default=4)
     return parser
-
-
-def summarize_rows(rows):
-    summary = {}
-    for name in sorted({row["region"] for row in rows}):
-        region_rows = [r for r in rows if r["region"] == name]
-        region = {
-            "cases": len(region_rows),
-            "status_counts": dict(Counter(r["status"] for r in region_rows)),
-        }
-        for metric in ("dice", "iou"):
-            values = [r[metric] for r in region_rows if r[metric] is not None]
-            region[f"mean_{metric}"] = float(np.mean(values)) if values else None
-            region[f"{metric}_defined_cases"] = len(values)
-        for unit in ("mm", "voxel"):
-            values = [r[f"hd95_{unit}"] for r in region_rows if r[f"hd95_{unit}"] is not None]
-            region[f"hd95_{unit}_defined_mean"] = float(np.mean(values)) if values else None
-            region[f"hd95_{unit}_defined_cases"] = len(values)
-            region[f"hd95_{unit}_undefined_cases"] = len(region_rows) - len(values)
-            asd_values = [r[f"asd_{unit}"] for r in region_rows if r.get(f"asd_{unit}") is not None]
-            region[f"asd_{unit}_defined_mean"] = float(np.mean(asd_values)) if asd_values else None
-            region[f"asd_{unit}_defined_cases"] = len(asd_values)
-            region[f"asd_{unit}_undefined_cases"] = len(region_rows) - len(asd_values)
-        summary[name] = region
-    for metric in ("dice", "iou"):
-        values = [summary[name][f"mean_{metric}"] for name in CLASS_NAMES[1:] if summary[name][f"mean_{metric}"] is not None]
-        summary[f"macro_foreground_{metric}"] = float(np.mean(values)) if values else None
-    return summary
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.batch_size < 1 or args.cpu_threads < 1:
         raise ValueError("batch-size and cpu-threads must be positive")
-    if args.spacing is not None and (not np.isfinite(args.spacing).all() or min(args.spacing) <= 0):
-        raise ValueError("Spacing must be finite and positive.")
     torch.set_num_threads(args.cpu_threads)
     checkpoint = load_checkpoint(args.checkpoint)
+    if checkpoint.get("benchmark_protocol") != BENCHMARK_PROTOCOL or "benchmark_data" not in checkpoint:
+        raise ValueError("Checkpoint predates the locked voxel benchmark protocol; start a new Phase 1 run.")
+    label_order = args.label_order or checkpoint["args"]["label_order"]
+    if resolve_label_order(label_order) != checkpoint["benchmark_data"]["source_label_order"]:
+        raise ValueError("Evaluation label order differs from the locked training convention")
     device = resolve_device(args.device)
     amp_dtype = resolve_amp(args.amp, device)
 
@@ -114,7 +78,6 @@ def main(argv=None):
 
     list_dir = Path(args.list_dir) if args.list_dir else run_dir / "splits"
     output = Path(args.output_dir) if args.output_dir else run_dir / ("evaluation_" + args.split)
-    output.mkdir(parents=True, exist_ok=True)
     roots = [str(Path(args.data_root) / modality / f"{args.split}_h5") for modality in ("bSSFP", "LGE", "T2w")]
 
     for split_name, expected in checkpoint["split_hashes"].items():
@@ -132,12 +95,22 @@ def main(argv=None):
             f"Evaluation split overlaps patients used for training/model selection: {sorted(overlap)[:10]}"
         )
 
+    saved_ids = set(read_split_names(run_dir / "splits", args.split))
+    if set(read_split_names(list_dir, args.split)) != saved_ids:
+        raise ValueError("Evaluation patients must exactly match the saved split; subsets are not a locked benchmark")
+    data_lock = lock_benchmark_data(args.data_root, run_dir / "splits", label_order)
+    if data_lock != checkpoint["benchmark_data"]:
+        raise ValueError("Cache bytes or label convention changed since training")
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError("Evaluation directory is not empty; choose a new --output-dir")
+
     dataset = MyopsDataset(
         *roots,
         str(list_dir),
         args.split,
-        label_order=args.label_order or checkpoint["args"]["label_order"],
+        label_order=label_order,
     )
+    output.mkdir(parents=True, exist_ok=True)
     rows, total_seconds, total_slices = [], 0.0, 0
     for sample in dataset:
         case = sample["case_name"]
@@ -159,57 +132,19 @@ def main(argv=None):
         total_seconds += elapsed
         total_slices += prediction.shape[2]
         target = np.asarray(sample["label"])
-        known_geometry = bool(sample.get("has_geometry", False))
-        spacing = (
-            args.spacing
-            if args.spacing is not None
-            else (sample["spacing"] if known_geometry and sample.get("spacing_unit") == "mm" else None)
-        )
-        if spacing is not None and known_geometry and args.spacing is not None and not np.allclose(spacing, sample["spacing"]):
-            raise ValueError("Explicit spacing conflicts with stored geometry.")
-        if spacing is not None and sample.get("has_affine", False):
-            axes = np.asarray(sample["affine"])[:3, :3]
-            axes = axes / np.linalg.norm(axes, axis=0)
-            if not np.allclose(axes.T @ axes, np.eye(3), atol=1e-4):
-                raise ValueError(
-                    "HD95 with axis spacing requires an orthogonal grid; resample sheared NIfTI upstream."
-                )
-        regions = [(name, prediction == i, target == i) for i, name in enumerate(CLASS_NAMES) if i]
-        regions.extend([
-            ("edema_inclusive", prediction >= 2, target >= 2),
-            ("myocardial_ring", prediction >= 1, target >= 1),
-        ])
-        for name, pred, truth in regions:
-            metrics = binary_metrics(pred, truth, spacing,
-                                     compute_distance=spacing is not None or args.allow_voxel_spacing,
-                                     empty_mode="undefined")
-            unit = "mm" if spacing is not None else ("voxel" if args.allow_voxel_spacing else "unknown")
-            rows.append(
-                dict(
-                    case=case,
-                    region=name,
-                    **metrics,
-                    hd95_unit=unit,
-                    hd95_mm=metrics["hd95"] if unit == "mm" else None,
-                    hd95_voxel=metrics["hd95"] if unit == "voxel" else None,
-                    hd95_status=(metrics["status"] if metrics["status"] != "ok" else
-                                 ("missing_physical_geometry" if unit == "unknown" else "ok")),
-                    asd_unit=unit,
-                    asd_mm=metrics["asd"] if unit == "mm" else None,
-                    asd_voxel=metrics["asd"] if unit == "voxel" else None,
-                    asd_status=(metrics["status"] if metrics["status"] != "ok" else
-                                ("missing_physical_geometry" if unit == "unknown" else "ok")),
-                    inference_seconds=elapsed,
-                )
-            )
+        case_rows = benchmark_rows(prediction, target, case)
+        for row in case_rows:
+            row["inference_seconds"] = elapsed
+        rows.extend(case_rows)
         if args.save_predictions:
             np.savez_compressed(
                 output / f"{case}_pred.npz",
                 prediction=prediction,
                 class_names=np.asarray(CLASS_NAMES),
-                spacing=np.asarray(spacing) if spacing is not None else np.full(3, np.nan),
+                spacing=np.asarray(sample["spacing"]),
                 affine=np.asarray(sample["affine"]),
-                spacing_unit="mm" if spacing is not None else "unknown",
+                spacing_unit=sample["spacing_unit"],
+                metric_distance_unit="voxel",
             )
             if sample.get("has_affine", False):
                 import nibabel as nib
@@ -219,7 +154,7 @@ def main(argv=None):
                     nifti.header.set_xyzt_units("mm")
                 nib.save(nifti, output / f"{case}_pred.nii.gz")
         print(
-            f"{case}: {prediction.shape[2]} slices, {elapsed:.3f}s, HD95 unit={unit}",
+            f"{case}: {prediction.shape[2]} slices, {elapsed:.3f}s, HD95 unit=voxel",
             flush=True,
         )
     if not rows:
@@ -238,7 +173,10 @@ def main(argv=None):
         inference_seconds=total_seconds,
         inference_slices_per_second=total_slices / total_seconds,
         timing_note="Includes transfer and resizing, excludes disk I/O/metrics; first case includes warmup.",
-        hd95_note="mm and voxel distances are never mixed. Unknown physical geometry gives null mm HD95. Means include only defined surfaces; inspect counts. Missed lesions have Dice/IoU=0.",
+        benchmark_protocol=BENCHMARK_PROTOCOL,
+        benchmark_data=data_lock,
+        split_hashes=checkpoint["split_hashes"],
+        hd95_note="All distances are voxel distances (unit grid), never mm. Primary means exclude undefined surfaces; inspect counts. Official reproduction is separately named and retains the upstream empty-mask behavior.",
         device=str(device),
         amp_dtype=str(amp_dtype),
     )

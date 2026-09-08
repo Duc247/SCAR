@@ -19,7 +19,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from training.dataset.data_contract import CLASS_NAMES, ensure_patient_splits
+from training.dataset.data_contract import CLASS_NAMES, ensure_patient_splits, lock_benchmark_data
 from training.dataset.myops_dataset import (
     MyopsDataset,
     RandomGenerator,
@@ -28,6 +28,18 @@ from training.dataset.myops_dataset import (
 from training.loss.losses import SegmentationLoss
 from training.metrics.confusion_meter import ConfusionMeter
 from training.dataset.sampler import build_rare_class_sampler
+from training.predict import predict_volume
+from training.metrics.surface_distance import BENCHMARK_PROTOCOL, benchmark_rows, summarize_rows
+
+
+def validate_volumes(model, dataset, img_size, batch_size, device, amp_dtype):
+    """Selection uses native-grid full patients, never pixel-pooled slice scores."""
+    rows = []
+    for sample in dataset:
+        prediction = predict_volume(model, [sample[k] for k in ("image", "image1", "image2")],
+                                    img_size, batch_size, device, amp_dtype)
+        rows.extend(benchmark_rows(prediction, sample["label"], sample["case_name"], compute_distance=False))
+    return summarize_rows(rows)
 
 
 def seed_everything(seed: int, deterministic: bool = True):
@@ -333,6 +345,9 @@ class Trainer:
 
 
 def trainer_Myops(args, model, snapshot_path):
+    resume_checkpoint = load_checkpoint(args.resume) if args.resume else None
+    if resume_checkpoint is not None and resume_checkpoint.get("benchmark_protocol") != BENCHMARK_PROTOCOL:
+        raise ValueError("Cannot resume a checkpoint selected under an older metric protocol; start a new Phase 1 run.")
     directory = Path(snapshot_path)
     directory.mkdir(parents=True, exist_ok=True)
     logger = make_logger(directory)
@@ -349,6 +364,7 @@ def trainer_Myops(args, model, snapshot_path):
         for name in ("train", "val", "val_vol", "test_vol")
         if (split_dir / f"{name}.txt").is_file()
     }
+    benchmark_data = lock_benchmark_data(args.data_root, split_dir, args.label_order)
     roots = [str(Path(args.data_root) / modality / "train_npz") for modality in ("bSSFP", "LGE", "T2w")]
     datasets = [
         MyopsDataset(
@@ -377,6 +393,10 @@ def trainer_Myops(args, model, snapshot_path):
     trainloader = DataLoader(datasets[0], shuffle=sampler is None, sampler=sampler,
                              generator=generator, **common)
     valloader = DataLoader(datasets[1], shuffle=False, generator=torch.Generator().manual_seed(args.seed + 1), **common)
+    validation_volumes = MyopsDataset(
+        *[Path(args.data_root) / modality / "val_vol_h5" for modality in ("bSSFP", "LGE", "T2w")],
+        split_dir, "val_vol", label_order=args.label_order,
+    )
     model.to(device)
     criterion = SegmentationLoss(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr, weight_decay=args.weight_decay, foreach=False)
@@ -393,7 +413,9 @@ def trainer_Myops(args, model, snapshot_path):
                            "metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest()}
 
     if args.resume:
-        checkpoint = load_checkpoint(args.resume)
+        checkpoint = resume_checkpoint
+        if checkpoint.get("benchmark_data") != benchmark_data:
+            raise ValueError("Cache bytes or source label convention changed since training")
         if Path(checkpoint["args"]["data_root"]).resolve() != Path(args.data_root).resolve():
             raise ValueError("Resume data-root differs from the original dataset. Keep the dataset path fixed.")
         for key in (
@@ -442,8 +464,11 @@ def trainer_Myops(args, model, snapshot_path):
         restore_rng(checkpoint["rng"])
         logger.info("Resumed complete state at epoch %d, optimizer update %d", start_epoch + 1, global_step)
         del checkpoint
+        del resume_checkpoint
 
     config_record = dict(
+        benchmark_protocol=BENCHMARK_PROTOCOL,
+        benchmark_data=benchmark_data,
         args=vars(args),
         model_config=model_config,
         class_names=CLASS_NAMES,
@@ -473,7 +498,7 @@ def trainer_Myops(args, model, snapshot_path):
         args.batch_size * args.accum_steps,
     )
     logger.info(
-        "Selection: validation pixel-pooled mean foreground Dice; early stopping %s",
+        "Selection: validation patient-mean scar/exclusive-edema Dice (avg_pathology_dice); early stopping %s",
         f"patience={args.patience}" if args.patience else "disabled (fixed ablation budget)",
     )
     writer = step_writer = None
@@ -525,7 +550,11 @@ def trainer_Myops(args, model, snapshot_path):
                 log_every=args.log_every,
                 logger=logger,
             )
-            score = val_metrics["mean_dice"]
+            volume_metrics = validate_volumes(model, validation_volumes, args.img_size,
+                                               args.batch_size, device, amp_dtype)
+            score = volume_metrics["avg_pathology_dice"]
+            if score is None:
+                raise ValueError("Pathology selection requires defined validation Dice for both scar and edema")
             if not math.isfinite(score):
                 raise ValueError("Validation foreground Dice undefined: check labels and held-out patients.")
             meaningful = score > patience_score + args.min_delta
@@ -549,7 +578,15 @@ def trainer_Myops(args, model, snapshot_path):
             }
             record.update({f"train/{key}": value for key, value in train_metrics.items()})
             record.update({f"val/{key}": value for key, value in val_metrics.items()})
+            record["val/avg_pathology_dice"] = score
+            for region in ("scar", "edema"):
+                record[f"val/patient_dice/{region}"] = volume_metrics[region]["mean_dice"]
+                record[f"val/defined_cases/{region}"] = volume_metrics[region]["dice_defined_cases"]
+                record[f"val/undefined_cases/{region}"] = volume_metrics[region]["dice_undefined_cases"]
             payload = dict(
+                benchmark_protocol=BENCHMARK_PROTOCOL,
+                benchmark_data=benchmark_data,
+                validation_volume_metrics=volume_metrics,
                 format_version=1,
                 class_names=CLASS_NAMES,
                 model_config=model_config,

@@ -98,7 +98,7 @@ def build_parser():
         default=0.2,
         help="held-out TRAIN patients if val.txt is absent",
     )
-    parser.add_argument("--label-order", choices=["auto", "legacy", "canonical"], default="auto")
+    parser.add_argument("--label-order", choices=["legacy", "canonical"], default="legacy")
     parser.add_argument(
         "--patience",
         type=int,

@@ -9,11 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from preprocessing.preprocessing import MODALITIES
-from training.dataset.data_contract import read_split_names, validate_patient_splits, patient_id
+from training.dataset.data_contract import read_split_names, validate_patient_splits, patient_id, lock_benchmark_data
+from training.metrics.surface_distance import BENCHMARK_PROTOCOL
 from training.dataset.myops_dataset import MyopsDataset
 
 
-def verify_dataset(data_root, list_dir, label_order="auto"):
+def verify_dataset(data_root, list_dir, label_order="legacy"):
+    data_lock = lock_benchmark_data(data_root, list_dir, label_order)
     splits = {s: read_split_names(list_dir, s) for s in ("train", "val", "test_vol")}
     patients = validate_patient_splits(splits)
     if not all(splits.values()):
@@ -31,10 +33,11 @@ def verify_dataset(data_root, list_dir, label_order="auto"):
             total += 1
         counts[split] = len(dataset)
     result = {"status": "passed", "sample_counts": counts,
+              "benchmark_protocol": BENCHMARK_PROTOCOL, "benchmark_data": data_lock,
               "patient_counts": {k: len(v) for k, v in patients.items()},
               "samples_with_mm_geometry": with_mm,
               "samples_without_mm_geometry": total - with_mm,
-              "geometry_note": "Unknown units remain unknown. HD95 mm requires physical metadata."}
+              "geometry_note": "MyoPS380 benchmark uses voxel HD95 on the unit grid; physical spacing is not required or inferred."}
     return result
 
 
@@ -42,7 +45,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="E:/STUDY/DATASET/MyoPS380/Processed_data")
     parser.add_argument("--list-dir", default=str(ROOT / "data/processed/splits"))
-    parser.add_argument("--label-order", choices=("auto", "legacy", "canonical"), default="auto")
+    parser.add_argument("--label-order", choices=("legacy", "canonical"), default="legacy")
     result = verify_dataset(**vars(parser.parse_args(argv)))
     print(json.dumps(result, indent=2))
     return result

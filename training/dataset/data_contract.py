@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import re
 
@@ -16,6 +17,58 @@ LABEL_ORDERS = {
     CANONICAL_LABEL_ORDER: CANONICAL_LABEL_ORDER,
     LEGACY_LABEL_ORDER: LEGACY_LABEL_ORDER,
 }
+
+# SHA256 of sorted, newline-terminated official 76 patient IDs (independent of CRLF).
+OFFICIAL_TEST_IDS_SHA256 = "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc"
+
+
+def lock_benchmark_data(data_root, list_dir, label_order):
+    """Validate MyoPS380 cohort and fingerprint cache bytes without changing data.
+
+    Persist the returned record in the run/checkpoint. Resume/evaluation compare
+    this record, so changing files in place cannot silently change a benchmark.
+    """
+    if label_order == "auto":
+        raise ValueError("Locked benchmark requires explicit legacy or canonical label order")
+    order = resolve_label_order(label_order)
+    splits = {s: read_split_names(list_dir, s) for s in ("train", "val", "test_vol")}
+    patients = validate_patient_splits(splits)
+    fixed_hash = hashlib.sha256(("\n".join(sorted(splits["test_vol"])) + "\n").encode()).hexdigest()
+    if fixed_hash != OFFICIAL_TEST_IDS_SHA256:
+        raise ValueError("Test patients differ from the official MyoPS380 76-case cohort")
+    if not patients["train"] or not patients["val"] or len(patients["train"] | patients["val"]) != 304:
+        raise ValueError("MyoPS380 requires 304 non-test patients split into nonempty train/val sets")
+    if set().union(*patients.values()) != {f"case{i:04d}" for i in range(1, 381)}:
+        raise ValueError("MyoPS380 cohort must contain exactly case0001 through case0380")
+    if _validate_volume_validation(list_dir, splits["val"]) is None:
+        raise ValueError("Locked patient-level selection requires val_vol.txt")
+    root = Path(data_root)
+    files = []
+    for modality in ("bSSFP", "LGE", "T2w"):
+        for folder, suffix, expected in (
+            ("train_npz", ".npz", set(splits["train"] + splits["val"])),
+            ("test_vol_h5", ".npy.h5", set(splits["test_vol"])),
+        ):
+            paths = list((root / modality / folder).glob("*" + suffix))
+            if {p.name[:-len(suffix)] for p in paths} != expected:
+                raise ValueError(f"Cache inventory differs from locked manifests: {modality}/{folder}")
+            files.extend(paths)
+        volumes = list((root / modality / "val_vol_h5").glob("*.npy.h5"))
+        if volumes and {p.name[:-7] for p in volumes} != patients["val"]:
+            raise ValueError(f"Incomplete validation volume inventory: {modality}")
+        files.extend(volumes)
+    metadata = root / "dataset_metadata.json"
+    if metadata.is_file():
+        files.append(metadata)
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda p: p.relative_to(root).as_posix()):
+        with path.open("rb") as stream:
+            file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+        digest.update(f"{path.relative_to(root).as_posix()}\0{file_hash}\n".encode())
+    return {"schema_version": 1, "source_label_order": order,
+            "canonical_class_names": list(CLASS_NAMES), "cache_sha256": digest.hexdigest(),
+            "cache_files": len(files), "official_test_ids_sha256": fixed_hash,
+            "patient_counts": {s: len(ids) for s, ids in patients.items()}}
 
 
 def resolve_label_order(value):
@@ -113,7 +166,8 @@ def ensure_patient_splits(list_dir, val_fraction=0.2, seed=42, output_dir=None):
     if all((destination / f"{s}.txt").is_file() for s in ("train", "val", "test_vol")):
         splits = {s: read_split_names(destination, s) for s in ("train", "val", "test_vol")}
         validate_patient_splits(splits)
-        _validate_volume_validation(destination, splits["val"])
+        if _validate_volume_validation(destination, splits["val"]) is None:
+            _write_manifest(destination / "val_vol.txt", sorted({patient_id(n) for n in splits["val"]}))
         if not splits["train"] or not splits["val"]:
             raise ValueError("Both training and validation splits must be nonempty.")
         return destination
@@ -139,8 +193,7 @@ def ensure_patient_splits(list_dir, val_fraction=0.2, seed=42, output_dir=None):
         raise ValueError("Both training and validation splits must be nonempty.")
     for split, names in splits.items():
         _write_manifest(destination / f"{split}.txt", names)
-    if val_volumes is not None:
-        _write_manifest(destination / "val_vol.txt", val_volumes)
+    _write_manifest(destination / "val_vol.txt", val_volumes if val_volumes is not None else sorted(patients["val"]))
     metadata = {
         "seed": seed,
         "val_fraction_of_training_patients": val_fraction,

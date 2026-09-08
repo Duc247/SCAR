@@ -2,7 +2,78 @@
 from __future__ import annotations
 
 import numpy as np
+from collections import Counter
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
+
+
+BENCHMARK_PROTOCOL = {
+    "id": "myops380_voxel_v1",
+    "distance_unit": "voxel",
+    "voxelspacing": None,
+    "axis_order": "HWD",
+    "regions": {"normal_myocardium": [1], "edema": [2], "scar": [3],
+                "edema_inclusive": [2, 3], "myocardial_ring": [1, 2, 3]},
+    "primary_empty_policy": "both_empty: excluded; one_empty: Dice/IoU=0, distances undefined",
+    "aggregation": "equal patient weight within each region; exclude undefined values and report counts",
+    "selection_metric": "avg_pathology_dice",
+    "pathology_regions": ["scar", "edema"],
+    "pathology_aggregation": "arithmetic mean of scar and exclusive-edema patient means; both required",
+    "official_reference": "I_MMSeg@90f46c4eb72924509895fcda6bc6a3b8c3316e66/utils.py:171-182",
+    "official_empty_policy": "if either empty: Dice=1 when pred<200 and target<=200, else 0; HD95=0",
+}
+
+
+def benchmark_rows(prediction, target, case, compute_distance=True):
+    """Two evaluators on identical canonical HWD predictions; never mutate masks."""
+    prediction, target = np.asarray(prediction), np.asarray(target)
+    if prediction.ndim != 3 or prediction.shape != target.shape or not prediction.size:
+        raise ValueError("Benchmark requires matching nonempty HWD volumes")
+    if not np.isin(prediction, [0, 1, 2, 3]).all() or not np.isin(target, [0, 1, 2, 3]).all():
+        raise ValueError("Benchmark requires canonical integer labels 0..3")
+    rows = []
+    for region, ids in BENCHMARK_PROTOCOL["regions"].items():
+        pred, truth = np.isin(prediction, ids), np.isin(target, ids)
+        metrics = binary_metrics(pred, truth, compute_distance=compute_distance)
+        n_pred, n_true = int(pred.sum()), int(truth.sum())
+        official_dice, official_hd95 = metrics["dice"], metrics["hd95"]
+        if not n_pred or not n_true:
+            official_dice = float(n_pred < 200 and n_true <= 200)
+            official_hd95 = 0.0 if compute_distance else None
+        rows.append(dict(case=case, region=region, **metrics,
+                         prediction_voxels=n_pred, target_voxels=n_true,
+                         hd95_unit="voxel", hd95_voxel=metrics["hd95"],
+                         asd_voxel=metrics["asd"],
+                         official_dice=official_dice, official_hd95_voxel=official_hd95))
+    return rows
+
+
+def summarize_rows(rows):
+    """Case means, defined counts and separately named official reproduction metrics."""
+    summary = {}
+    identities = [(r["case"], r["region"]) for r in rows]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Duplicate case/region rows would bias patient means")
+    expected = set(BENCHMARK_PROTOCOL["regions"])
+    for case in {r["case"] for r in rows}:
+        if {r["region"] for r in rows if r["case"] == case} != expected:
+            raise ValueError(f"Incomplete benchmark regions for {case}")
+    for name in BENCHMARK_PROTOCOL["regions"]:
+        subset = [r for r in rows if r["region"] == name]
+        region = {"cases": len(subset), "status_counts": dict(Counter(r["status"] for r in subset))}
+        for metric in ("dice", "iou", "hd95_voxel", "asd_voxel", "official_dice", "official_hd95_voxel"):
+            values = [r[metric] for r in subset if r[metric] is not None]
+            if not all(np.isfinite(v) for v in values):
+                raise ValueError(f"Non-finite {metric}; undefined values must be None")
+            region[f"mean_{metric}"] = float(np.mean(values)) if values else None
+            region[f"{metric}_defined_cases"] = len(values)
+            region[f"{metric}_undefined_cases"] = len(subset) - len(values)
+        summary[name] = region
+    for metric in ("dice", "iou", "official_dice", "hd95_voxel", "official_hd95_voxel"):
+        values = [summary[name][f"mean_{metric}"] for name in ("scar", "edema")]
+        key = (f"official_avg_pathology_{metric.removeprefix('official_')}"
+               if metric.startswith("official_") else f"avg_pathology_{metric}")
+        summary[key] = float(np.mean(values)) if all(v is not None for v in values) else None
+    return summary
 
 
 def binary_metrics(prediction, target, spacing=None, compute_distance=True, empty_mode="undefined"):
@@ -40,8 +111,6 @@ def binary_metrics(prediction, target, spacing=None, compute_distance=True, empt
             result["status"] = "prediction_empty" if not n_pred else "target_empty"
         return result
     if not compute_distance:
-        if spacing is None:
-            result["status"] = "missing_physical_geometry"
         return result
     structure = generate_binary_structure(pred.ndim, 1)
     pred_surface = pred ^ binary_erosion(pred, structure=structure, border_value=0)

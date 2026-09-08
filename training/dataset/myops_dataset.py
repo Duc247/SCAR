@@ -8,7 +8,6 @@ from __future__ import annotations
 from pathlib import Path
 import random
 import re
-import warnings
 
 import h5py
 import numpy as np
@@ -118,7 +117,6 @@ class MyopsDataset(Dataset):
         self.label_order = label_order if label_order == "auto" else resolve_label_order(label_order)
         self.is_volume = split.endswith("vol") or split in {"test", "volume"}
         self.extension = ".npy.h5" if self.is_volume else ".npz"
-        self._warned_legacy = False
         self.volume_slices = {}
         if split == "val_vol":
             # The original release has validation NPZ slices but no val HDF5.
@@ -168,14 +166,9 @@ class MyopsDataset(Dataset):
                 metadata = {key: data[key].copy() for key in ("label_order", "spacing", "affine", "spacing_unit", "patient_id", "axis_order", "normalization") if key in data}
         stored_order = metadata.get("label_order")
         if stored_order is None:
-            order = LEGACY_LABEL_ORDER if self.label_order == "auto" else self.label_order
-            if self.label_order == "auto" and not self._warned_legacy:
-                warnings.warn(
-                    "Files without label_order metadata are interpreted as legacy I-MMSeg (0 background, 1 normal, 2 scar, 3 edema) and remapped to canonical 0 background, 1 normal, 2 edema, 3 scar. Pass label_order='canonical' for metadata-free files already in canonical order.",
-                    UserWarning,
-                    stacklevel=3,
-                )
-                self._warned_legacy = True
+            if self.label_order == "auto":
+                raise ValueError(f"Missing label_order metadata in {path}; specify legacy or canonical explicitly.")
+            order = self.label_order
         else:
             order = resolve_label_order(stored_order)
             if self.label_order != "auto" and order != self.label_order:

@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-split", choices=["test_vol", "val_vol"], default="test_vol")
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--run-root", help="Experiment directory, defaults to training YAML")
-    parser.add_argument("--label-order", choices=["auto", "legacy", "canonical"])
+    parser.add_argument("--label-order", choices=["legacy", "canonical"])
     parser.add_argument("--normalization", choices=["unit255", "unit", "percentile"])
     for name, kind in (("epochs", int), ("batch-size", int), ("accum-steps", int),
                        ("num-workers", int), ("cpu-threads", int), ("lr", float)):

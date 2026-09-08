@@ -112,7 +112,7 @@ flowchart LR
 
 > [!IMPORTANT]
 > **Tương thích ngược dữ liệu Legacy:**
-> Bộ cache cũ của I_MMSeg dùng quy ước `2=scar, 3=edema`. Hệ thống tự động phát hiện metadata và hoán vị về chuẩn canonical `[0, 1, 3, 2]` thông qua [`data_contract.py`](training/dataset/data_contract.py). 
+> Bộ cache cũ của I_MMSeg dùng quy ước `2=scar, 3=edema`. Chọn `--label-order legacy` cho cache tác giả; chọn `canonical` cho cache mới do SCAR đóng gói. Hệ thống kiểm tra metadata nếu có và hoán vị về chuẩn canonical `[0, 1, 3, 2]` thông qua [`data_contract.py`](training/dataset/data_contract.py).
 
 ### Phân chia Dataset (Patient-level Split):
 * **Tổng số ca:** 380 bệnh nhân (MyoPS-380).
@@ -184,10 +184,26 @@ python test.py \
     --save-predictions
 ```
 
-Báo cáo kết quả được lưu tại `outputs/runs/m3_run01/eval_test_vol/` gồm:
+Báo cáo kết quả được lưu tại `outputs/runs/m3_run01/evaluation_test_vol/` gồm:
 * `per_case.csv`: Chi tiết Dice, IoU, HD95, ASD cho từng ca bệnh.
-* `summary.json`: Điểm trung bình phân đoạn trên toàn bộ tập test.
-* Các file mask dự đoán dạng NIfTI (`.nii.gz`) bảo toàn affine và voxel spacing gốc.
+* `metrics.json`: Điểm theo bệnh nhân, protocol, hash dữ liệu và số ca metric xác định/không xác định.
+* Mask `.npz`; chỉ xuất thêm NIfTI khi cache có affine hợp lệ. Không tạo geometry giả cho cache legacy.
+
+---
+
+## Protocol benchmark đã khóa (Phase 1)
+
+Protocol `myops380_voxel_v1` tính HD95/ASD trên lưới voxel đơn vị (`voxelspacing=None`), không phải mm. Dữ liệu đã chuẩn hóa in-plane; spacing z vật lý không có trong bản phát hành và không được suy diễn từ affine identity. Không cần truyền `--spacing` hoặc `--allow-voxel-spacing`.
+
+- Nhãn đầu ra canonical: `0=background, 1=normal_myocardium, 2=edema, 3=scar`. Cache chính thức thiếu metadata dùng `--label-order legacy`; cache SCAR mới dùng `canonical`. `auto` không còn đoán nhãn cho file thiếu metadata.
+- Region độc lập: normal `[1]`, edema `[2]`, scar `[3]`; region hợp: edema-inclusive `[2,3]`, myocardial ring `[1,2,3]`. Không tự coi region hợp là cột tương ứng trong paper.
+- Metric chính: cả hai mask rỗng thì Dice/IoU/HD95 không xác định; một mask rỗng thì Dice/IoU bằng 0, distance không xác định. Trung bình chỉ dùng giá trị xác định và luôn kèm số ca, trạng thái empty.
+- `avg_pathology_dice` = trung bình của hai patient-mean Dice scar và edema riêng (cần cả hai giá trị xác định). Dice lưu trong [0,1]. Metric này trên **validation volume** chọn `best.pth` và điều khiển early stopping; test không tham gia chọn mô hình.
+- `official_dice`, `official_hd95_voxel` và `official_avg_pathology_dice` là kết quả evaluator I-MMSeg tái lập trên cùng prediction. Giữ nguyên ngoại lệ upstream: nếu một mask rỗng, trả Dice=1 khi pred<200 và GT<=200 voxel, ngược lại Dice=0; HD95=0. Các điểm này được báo riêng, không dùng để chọn checkpoint. Đây là parity của evaluator, không phải tuyên bố tái lập toàn bộ training của paper.
+- 76 ID test chính thức được khóa bằng hash; 304 ca còn lại chia train/val. Hash nội dung cache, quy ước nhãn, protocol và hash manifest được lưu trong `config.json`, checkpoint và báo cáo evaluation. Resume/evaluation từ chối thay đổi dữ liệu, đổi nhãn hoặc đổi split; evaluation không nhận tập con của split đã lưu.
+- Checkpoint cũ chưa lưu protocol không được resume/evaluate trong chế độ benchmark đã khóa. Cần bắt đầu run Phase 1 mới; không tái sử dụng best score từ metric cũ. Chạy lại evaluation phải chọn thư mục đầu ra mới nếu thư mục cũ đã có dữ liệu.
+
+`val/mean_dice` trong log vẫn là chỉ số pixel-pooled phụ; đường chọn checkpoint là `val/avg_pathology_dice`. Mỗi epoch có thêm lượt inference trên validation volumes. Khóa dữ liệu đọc toàn bộ cache để tính hash ở đầu train/resume/evaluation; hãy giữ cache bất biến trong lúc chạy.
 
 ---
 
