@@ -75,7 +75,7 @@ def build_parser():
         help="microbatch on one device",
     )
     parser.add_argument("--accum-steps", type=int, default=1)
-    parser.add_argument("--lr", "--base_lr", dest="base_lr", type=float, default=0.001)
+    parser.add_argument("--lr", "--base_lr", dest="base_lr", type=float, default=0.0003)
     parser.add_argument("--weight-decay", type=float, default=0.0001)
     parser.add_argument("--img-size", "--img_size", dest="img_size", type=int, default=128)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")

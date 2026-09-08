@@ -157,7 +157,7 @@ python train.py \
     --list-dir data/processed/splits \
     --output-dir outputs/runs/m3_run01 \
     --batch-size 16 \
-    --lr 0.001 \
+    --lr 0.0003 \
     --epochs 300 \
     --amp auto \
     --pretrained model/vit_checkpoint/imagenet21k/R50-ViT-B_16.npz

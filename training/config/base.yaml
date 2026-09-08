@@ -9,7 +9,7 @@ train:
   epochs: 300
   batch_size: 16
   accum_steps: 1
-  lr: 0.001
+  lr: 0.0003
   weight_decay: 0.0001
   clip_grad: 1.0
   patience: 0

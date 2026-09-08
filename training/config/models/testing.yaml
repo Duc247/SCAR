@@ -16,7 +16,7 @@ train:
   epochs: 2
   batch_size: 2
   accum_steps: 2
-  lr: 0.001
+  lr: 0.0003
   log_every: 1
 
 data:
