@@ -35,6 +35,9 @@ def benchmark_rows(prediction, target, case, compute_distance=True):
         pred, truth = np.isin(prediction, ids), np.isin(target, ids)
         metrics = binary_metrics(pred, truth, compute_distance=compute_distance)
         n_pred, n_true = int(pred.sum()), int(truth.sum())
+        overlap = int(np.logical_and(pred, truth).sum())
+        metrics["precision"] = overlap / n_pred if n_pred else None
+        metrics["recall"] = overlap / n_true if n_true else None
         official_dice, official_hd95 = metrics["dice"], metrics["hd95"]
         if not n_pred or not n_true:
             official_dice = float(n_pred < 200 and n_true <= 200)
@@ -60,7 +63,7 @@ def summarize_rows(rows):
     for name in BENCHMARK_PROTOCOL["regions"]:
         subset = [r for r in rows if r["region"] == name]
         region = {"cases": len(subset), "status_counts": dict(Counter(r["status"] for r in subset))}
-        for metric in ("dice", "iou", "hd95_voxel", "asd_voxel", "official_dice", "official_hd95_voxel"):
+        for metric in ("dice", "iou", "precision", "recall", "hd95_voxel", "asd_voxel", "official_dice", "official_hd95_voxel"):
             values = [r[metric] for r in subset if r[metric] is not None]
             if not all(np.isfinite(v) for v in values):
                 raise ValueError(f"Non-finite {metric}; undefined values must be None")

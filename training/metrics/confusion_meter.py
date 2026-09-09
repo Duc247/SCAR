@@ -38,6 +38,8 @@ class ConfusionMeter:
         tp, predicted, actual = np.diag(matrix), matrix.sum(0), matrix.sum(1)
         result = {}
         for name, numerator, denominator in (
+            ("precision", tp, predicted),
+            ("recall", tp, actual),
             ("dice", 2 * tp, predicted + actual),
             ("iou", tp, predicted + actual - tp),
         ):

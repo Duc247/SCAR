@@ -22,6 +22,7 @@ from training.dataset.myops_dataset import MyopsDataset, Myops_dataset
 from training.predict import predict_volume
 from training.metrics.surface_distance import BENCHMARK_PROTOCOL, benchmark_rows, summarize_rows
 from training.models.cmspa_net import CMSPANet, VisionTransformer
+from training.models import model_from_config
 from training.trainer.trainer import (
     json_safe,
     load_checkpoint,
@@ -67,7 +68,7 @@ def main(argv=None):
     amp_dtype = resolve_amp(args.amp, device)
 
     config = ConfigDict(checkpoint["model_config"])
-    model = CMSPANet(config, img_size=checkpoint["args"]["img_size"], num_classes=4)
+    model = model_from_config(config, img_size=checkpoint["args"]["img_size"], num_classes=4)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
 
@@ -168,6 +169,7 @@ def main(argv=None):
         checkpoint=str(checkpoint_path),
         checkpoint_epoch=checkpoint["epoch"] + 1,
         ablation=config.ablation,
+        architecture=config.get("architecture", "cmspa_net"),
         split=args.split,
         case_count=len(dataset),
         inference_seconds=total_seconds,

@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"])
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--seed", type=int, default=None, help="Random seed; defaults to config YAML")
     return parser
 
 
@@ -65,7 +66,11 @@ def main(argv=None) -> Path:
     raw_root = project_path(args.raw_root or prep_config["data"]["raw_root"])
     test_list = project_path(args.test_list)
     run_root = project_path(args.run_root or config["outputs"]["run_root"])
-    run_id = args.run_id or f"{config['model']['ablation'].lower()}_{datetime.now():%Y%m%d_%H%M%S}"
+    seed = args.seed if args.seed is not None else config.get("seed", 1234)
+    model_name = config["model"].get("model_name") or config["model"].get("architecture", config["model"]["ablation"])
+    clean_model = str(model_name).replace(" ", "-").replace("/", "-")
+    timestamp = datetime.now().strftime("%Hh%M")
+    run_id = args.run_id or f"{clean_model}_seed{seed}_{timestamp}"
     if Path(run_id).name != run_id or run_id in {".", ".."} or "/" in run_id or "\\" in run_id:
         parser.error("--run-id must be a single directory name")
     run_dir = run_root / run_id
@@ -79,7 +84,7 @@ def main(argv=None) -> Path:
     if cache_present:
         run_command([python, "preprocessing/build_splits.py", "--data-root", str(data_root),
                      "--list-dir", str(list_dir), "--test-list", str(test_list),
-                     "--seed", str(config["seed"]), "--val-fraction", str(config["data"]["val_fraction"])],
+                     "--seed", str(seed), "--val-fraction", str(config["data"]["val_fraction"])],
                     "1/4: Validate or create patient manifests for the existing cache")
     else:
         normalization = args.normalization or prep_config["normalization"]
@@ -89,7 +94,7 @@ def main(argv=None) -> Path:
         run_command([python, "preprocessing/process_and_save.py", "--src-path", str(raw_root),
                      "--dst-path", str(data_root), "--list-dir", str(list_dir),
                      "--test-list", str(test_list), "--label-order", raw_label_order,
-                     "--normalization", normalization, "--seed", str(config["seed"]),
+                     "--normalization", normalization, "--seed", str(seed),
                      "--val-fraction", str(config["data"]["val_fraction"])],
                     "1/4: Package aligned NIfTI into a new cache and patient manifests")
     # Newly packaged files are canonical regardless of the raw encoding.
@@ -99,7 +104,8 @@ def main(argv=None) -> Path:
                 "2/4: Check synchronized modalities, labels, splits and geometry")
     train_command = [python, "training/train.py", "--config", str(project_path(args.config)),
                      "--run-id", run_id, "--run-root", str(run_root), "--data-root", str(data_root),
-                     "--list-dir", str(list_dir), "--label-order", label_order]
+                     "--list-dir", str(list_dir), "--label-order", label_order,
+                     "--seed", str(seed)]
     for name in ("epochs", "batch_size", "accum_steps", "num_workers", "cpu_threads", "lr", "device", "amp"):
         value = getattr(args, name)
         if value is not None:

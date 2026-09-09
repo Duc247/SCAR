@@ -20,6 +20,7 @@ from training.config.config_utils import (
     load_merged_config,
 )
 from training.models.cmspa_net import CONFIGS, CMSPANet
+from training.models import model_from_config
 from training.trainer.trainer import Trainer, seed_everything
 
 
@@ -51,7 +52,7 @@ def build_parser():
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Output directory; defaults to outputs/runs/{model_name}_{timestamp}",
+        help="Output directory; defaults to outputs/runs/{model_name}_seed{seed}_{HHhMM}",
     )
     parser.add_argument(
         "--run-root",
@@ -186,7 +187,11 @@ def main(argv=None):
         elif args.resume:
             output = Path(args.resume).resolve().parent
         else:
-            output = generate_run_dir(args.run_root, merged["model"].get("model_name", "CMSPA-Net"))
+            output = generate_run_dir(
+                args.run_root,
+                merged["model"].get("model_name", "CMSPA-Net"),
+                seed=args.seed,
+            )
     else:
         output = Path(args.output_dir)
     output = output.resolve()
@@ -201,15 +206,18 @@ def main(argv=None):
     config.resnet.num_layers = tuple(section["resnet"]["num_layers"])
     config.resnet.width_factor = float(section["resnet"]["width_factor"])
     config.transformer.dropout_rate = float(section.get("transformer", {}).get("dropout_rate", 0.1))
-    for key in ("decoder_channels", "skip_channels", "fused_channels", "n_skip", "cross_attention_heads", "classifier", "activation"):
+    for key in ("decoder_channels", "skip_channels", "fused_channels", "n_skip", "cross_attention_heads", "classifier", "activation",
+                "dpf_bottleneck_width", "dpf_skip_width", "dpf_loss_version"):
         if key in section:
             config[key] = tuple(section[key]) if key == "decoder_channels" else section[key]
     config.ablation = args.ablation
     config.gradient_checkpointing = args.gradient_checkpointing
     config.n_classes = 4
+    if "architecture" in section:
+        config.architecture = section["architecture"]
     torch.set_num_threads(args.cpu_threads)
     seed_everything(args.seed, args.deterministic)
-    model = CMSPANet(config, img_size=args.img_size, num_classes=4, ablation=args.ablation)
+    model = model_from_config(config, img_size=args.img_size, num_classes=4, ablation=args.ablation)
     if args.pretrained:
         model.load_pretrained_encoders(args.pretrained)
     return Trainer(model, args, output).fit()

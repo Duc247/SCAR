@@ -22,8 +22,10 @@ from training.models.modules.cmspa import CMSPA_Fusion
 from training.models.modules.decoder import DecoderCup, SegmentationHead
 from training.models.modules.fusion import ConcatFusion, CrossAttention_Fusion, Fusion_Embed
 from training.models.modules.sspanet import SSPANet_Block
+from training.models.m3_dpf import M3DPF
 
 MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
+    "m3_dpf": M3DPF,
     "cmspa_net": CMSPANet,
     "cmspa": CMSPANet,
     "vision_transformer": CMSPANet,
@@ -31,6 +33,12 @@ MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
     "sspanet_baseline": partial(CMSPANet, ablation="M1"),
     "cross_attn_baseline": partial(CMSPANet, ablation="M2"),
 }
+
+
+def model_from_config(config, **kwargs):
+    """Old checkpoints without an architecture field remain CMSPANet."""
+    architecture = config.get("architecture", "cmspa_net")
+    return build_model(architecture, config=config, **kwargs)
 
 
 def build_model(model_name: str, **kwargs) -> nn.Module:
@@ -48,6 +56,8 @@ def build_model(model_name: str, **kwargs) -> nn.Module:
 
 
 __all__ = [
+    "M3DPF",
+    "model_from_config",
     "CMSPANet",
     "VisionTransformer",
     "CONFIGS",

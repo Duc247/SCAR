@@ -1,5 +1,8 @@
 # SCAR: Phân đoạn Cơ tim Đa phương thức với SSPANet + CMSPA
 
+**M3-DPF (model riêng):** xem [thiết kế, loss, hướng dẫn train và precision/recall](docs/M3_DPF.md).
+Chọn `--config training/config/models/m3_dpf.yaml`; model và loss M3 mặc định vẫn giữ nguyên. Tài liệu được lưu UTF-8; công thức dùng Markdown math của GitHub. Trình xem local cần bật hỗ trợ math.
+
 <p align="center">
   <a href="https://colab.research.google.com/github/thanhquan123hi1/SCAR/blob/main/scar_pipeline.ipynb">
     <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">
@@ -12,7 +15,7 @@
 
 ---
 
-## 📖 Giới thiệu tổng quan
+## Giới thiệu tổng quan
 
 **SCAR** là hệ thống học sâu tiên tiến phục vụ phân đoạn tổn thương cơ tim đa phương thức trên tập dữ liệu cộng hưởng từ tim mạch **MyoPS-380**, kết hợp đồng thời ba chuỗi xung CMR đã căn chỉnh đồng bộ:
 * **bSSFP / CINE** (Cine Balanced Steady-State Free Precession - cấu trúc giải phẫu chuyển động)
@@ -27,20 +30,21 @@ Mô hình chủ lực **CMSPA-Net (M3)** kết hợp **3 encoder ResNetV2 độc
 
 ---
 
-## 📑 Mục lục
-- [🚀 Chạy nhanh trên Google Colab](#-chạy-nhanh-trên-google-colab)
-- [🏗️ Kiến trúc Mô hình CMSPA-Net (M3)](#️-kiến-trúc-mô-hình-cmspa-net-m3)
-- [🔬 Các cấu hình nghiên cứu (Ablation Studies M0–M3)](#-các-cấu-hình-nghiên-cứu-ablation-studies-m0m3)
-- [📦 Hợp đồng Dữ liệu & Quy ước Nhãn Canonical](#-hợp-đồng-dữ-liệu--quy-ước-nhãn-canonical)
-- [🛠️ Cài đặt Môi trường](#️-cài-đặt-môi-trường)
-- [🏋️ Huấn luyện Mô hình](#️-huấn-luyện-mô-hình)
-- [📊 Đánh giá & Xuất kết quả NIfTI](#-đánh-giá--xuất-kết-quả-nifti)
-- [📂 Cấu trúc Repository](#-cấu-trúc-repository)
-- [📚 Tài liệu Tham khảo](#-tài-liệu-tham-khảo)
+## Mục lục
+- [Chạy nhanh trên Google Colab](#chạy-nhanh-trên-google-colab)
+- [Kiến trúc Mô hình CMSPA-Net (M3)](#kiến-trúc-mô-hình-cmspa-net-m3)
+- [M3-DPF (thử nghiệm)](#m3-dpf-thử-nghiệm)
+- [Các cấu hình nghiên cứu (Ablation Studies M0–M3)](#các-cấu-hình-nghiên-cứu-ablation-studies-m0m3)
+- [Hợp đồng Dữ liệu & Quy ước Nhãn Canonical](#hợp-đồng-dữ-liệu--quy-ước-nhãn-canonical)
+- [Cài đặt Môi trường](#cài-đặt-môi-trường)
+- [Huấn luyện Mô hình](#huấn-luyện-mô-hình)
+- [Đánh giá & Xuất kết quả NIfTI](#đánh-giá--xuất-kết-quả-nifti)
+- [Cấu trúc Repository](#cấu-trúc-repository)
+- [Tài liệu Tham khảo](#tài-liệu-tham-khảo)
 
 ---
 
-## 🚀 Chạy nhanh trên Google Colab
+## Chạy nhanh trên Google Colab
 
 Bạn có thể chạy toàn bộ quy trình từ tải dữ liệu, tiền xử lý, huấn luyện M3 đến đánh giá volume 3D chỉ với một cú nhấp chuột:
 
@@ -56,7 +60,7 @@ Bạn có thể chạy toàn bộ quy trình từ tải dữ liệu, tiền xử
 
 ---
 
-## 🏗️ Kiến trúc Mô hình CMSPA-Net (M3)
+## Kiến trúc Mô hình CMSPA-Net (M3)
 
 ```mermaid
 flowchart LR
@@ -74,22 +78,84 @@ flowchart LR
     D --> O[Raw Logits 4 kênh: B, 4, 128, 128]
 ```
 
-### Thông số kỹ thuật & Công thức cốt lõi:
-* **Tham số mô hình**: **64.403.442 tham số** ở cấu hình đầy đủ `(3, 4, 9)`, `width_factor=1.0`.
-* **Khối SSPANet (Strip Pooling Attention)**:
-  $$Z = \text{Concat}(\text{MaxPool}_C(X), \text{MeanPool}_C(X))$$
-  $$\text{CA}(X) = X \odot \sigma(\text{BN}(\text{Conv}_{7\times 7}(Z)))$$
-  $$R_h = \sqrt{\text{Mean}_W(X^2) + \epsilon}, \quad R_w = \sqrt{\text{Mean}_H(X^2) + \epsilon}$$
-  $$\text{SA}(X) = X \odot \sigma\Big(\text{Conv}_{1\times 1}\big(\text{BN}(\text{Conv}_{3\times 1}(R_h)) + \text{BN}(\text{Conv}_{1\times 3}(R_w))\big)\Big)$$
-  $$\text{SSPA}(X) = X + X \odot \sigma(\text{CA}(X) + \text{SA}(X))$$
-* **Khối CMSPA Bottleneck Fusion**:
-  * **Anatomy Gate ($A$)**: Trích xuất từ tổng trung bình strip không gian của CINE: $\sigma(\text{Conv}(\text{Mean}_W(C) + \text{Mean}_H(C)))$.
-  * **Pathology Gate ($P$)**: Trích xuất từ độ lệch chuẩn kênh của LGE và T2w: $\sigma(\text{Conv}(\text{std}_C(\text{LGE}) + \text{std}_C(\text{T2w})))$.
-  * **Fusion**: $\text{Concat}(C + C \odot P, \text{LGE} \odot A, \text{T2w} \odot A) \xrightarrow{\text{Conv}_{1\times 1} + \text{BN} + \text{ReLU}} 512 \text{ channels}$.
+### Thông số và công thức
+
+M3 có **64.403.442 tham số** với encoder `(3, 4, 9)`, `width_factor=1.0`.
+Ký hiệu: $C$ là CINE, $L$ là LGE, $T$ là T2w; $\odot$ là nhân từng phần tử.
+Các phép lấy trung bình giữ lại chiều để broadcast. Công thức dưới đây mô tả code hiện tại.
+
+**SSPANet:** pooling theo kênh tạo gate không gian (giữ tên CA trong code).
+
+$$
+Z = \operatorname{Concat}(\operatorname{Max}_C(X),\operatorname{Mean}_C(X))
+$$
+
+$$
+\operatorname{CA}(X)=X\odot\sigma(\operatorname{BN}(\operatorname{Conv}_{7\times7}(Z)))
+$$
+
+$$
+R_h=\sqrt{\operatorname{Mean}_W(X^2)+\epsilon},\qquad
+R_w=\sqrt{\operatorname{Mean}_H(X^2)+\epsilon}
+$$
+
+$$
+U_h=\operatorname{BN}(\operatorname{Conv}_{3\times1}(R_h)),\qquad
+U_w=\operatorname{BN}(\operatorname{Conv}_{1\times3}(R_w))
+$$
+
+$$
+\operatorname{SA}(X)=X\odot\sigma(\operatorname{Conv}_{1\times1}(U_h+U_w))
+$$
+
+$$
+\operatorname{SSPA}(X)=X+X\odot\sigma(\operatorname{CA}(X)+\operatorname{SA}(X))
+$$
+
+**CMSPA:** $g_A$ và $g_P$ đều là Conv 1×1 → BN → ReLU → Conv 1×1 → sigmoid.
+Độ lệch chuẩn dùng population variance và epsilon; gate là đặc trưng học được, không phải mask giải phẫu được đảm bảo.
+
+$$
+A=g_A(\operatorname{Mean}_W(C)+\operatorname{Mean}_H(C))
+$$
+
+$$
+P=g_P\left(\sqrt{\operatorname{Var}_C(L)+\epsilon}+\sqrt{\operatorname{Var}_C(T)+\epsilon}\right)
+$$
+
+$$
+F=g_F(\operatorname{Concat}(C+C\odot P, L\odot A, T\odot A))
+$$
+
+$g_F$ là Conv 1×1 → BN → ReLU, đầu ra 512 kênh ở cấu hình mặc định.
+
+### M3-DPF (thử nghiệm)
+
+M3-DPF giữ ba encoder và SSPANet; thay fusion bottleneck ở 1/16 và skip thứ hai ở 1/4 bằng DualPathologyFusion. Mô hình mặc định có **64.525.984 tham số**.
+Hai router softmax trộn CINE/LGE/T2w cho hai expert. Nhánh skip có auxiliary logits theo thứ tự **scar, edema độc lập**. Expert ở bottleneck chỉ được giám sát gián tiếp qua đầu ra cuối; chưa có bảo đảm mỗi expert tự chuyên biệt đúng bệnh lý.
+
+$$
+F_{\mathrm{DPF}}=F_{\mathrm{concat}}+\sigma(\eta)\operatorname{Conv}_{1\times1}(\operatorname{Concat}(E_s,E_e))
+$$
+
+Hệ số residual ban đầu là 0,1. Loss phiên bản 1:
+
+$$
+\mathcal{L}=0.5\mathcal{L}_{\mathrm{CE}}+0.5\mathcal{L}_{\mathrm{Dice}}
++r(t)(0.2\mathcal{L}_{\mathrm{hierarchy}}+0.1\mathcal{L}_{\mathrm{aux}})
+$$
+
+$$
+r(t)=\min(t/10,1),\qquad t=1,2,\ldots
+$$
+
+Dice foreground có trọng số normal/edema/scar là 0,2/0,4/0,4 và chỉ trung bình trên ảnh có lớp mục tiêu. Hierarchy dùng hợp cơ tim `{1,2,3}` và hợp tổn thương `{2,3}`. Auxiliary BCE dùng mask trung bình xuống 1/4. CE/Dice có thể đổi qua CLI.
+
+Gradient accumulation không tương đương hoàn toàn batch lớn vì mẫu số Dice phụ thuộc lớp hiện diện trong từng microbatch; BatchNorm cũng dùng thống kê từng microbatch. Chưa có kết quả thực nghiệm chứng minh DPF tốt hơn M3. Xem [chi tiết M3-DPF](docs/M3_DPF.md) và [báo cáo rà soát](docs/M3_DPF_REVIEW.md).
 
 ---
 
-## 🔬 Các cấu hình nghiên cứu (Ablation Studies M0–M3)
+## Các cấu hình nghiên cứu (Ablation Studies M0–M3)
 
 | Mã Ablation | Attention từng nhánh | Fusion Bottleneck | File cấu hình YAML |
 |:---:|:---:|:---:|:---:|
@@ -100,7 +166,7 @@ flowchart LR
 
 ---
 
-## 📦 Hợp đồng Dữ liệu & Quy ước Nhãn Canonical
+## Hợp đồng Dữ liệu & Quy ước Nhãn Canonical
 
 ### Bảng nhãn Canonical chuẩn hóa:
 | ID Lớp | Tên nhãn | Định nghĩa giải phẫu |
@@ -121,7 +187,7 @@ flowchart LR
 
 ---
 
-## 🛠️ Cài đặt Môi trường
+## Cài đặt Môi trường
 
 Yêu cầu: **Python 3.11 hoặc 3.12**, **PyTorch ≥ 2.3**.
 
@@ -139,7 +205,7 @@ python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA Available:
 
 ---
 
-## 🏋️ Huấn luyện Mô hình
+## Huấn luyện Mô hình
 
 ### Cách 1: Tự động hóa toàn diện với `run_all.py` (Khuyên dùng)
 Tự động kiểm tra cache, tạo split bệnh nhân, kiểm định dữ liệu, huấn luyện mô hình M3 và đánh giá volume test:
@@ -163,16 +229,18 @@ python train.py \
     --pretrained model/vit_checkpoint/imagenet21k/R50-ViT-B_16.npz
 ```
 
-*(Đối với GPU nhỏ 4GB–6GB: hãy dùng `--batch-size 2 --accum-steps 8`).*
+Với GPU ít VRAM, bắt đầu bằng `--batch-size 2`; dùng `--accum-steps 8` nếu cần tích lũy gradient. Đo bộ nhớ thực tế trước khi tăng batch. Các lệnh nhiều dòng phía trên dùng cú pháp Bash; PowerShell cần viết trên một dòng hoặc dùng dấu backtick để nối dòng.
 
 ### Khôi phục huấn luyện (Resume):
+
+Truyền lại config và các tham số của run gốc, gồm batch size, accumulation, LR, số epoch và quy ước nhãn. `--resume` không tự nạp các tùy chọn CLI từ checkpoint; bỏ `--pretrained` khi resume.
 ```bash
-python train.py --resume outputs/runs/m3_run01/last.pth
+python train.py --config training/config/models/cmspa_net.yaml --data-root /path/to/Processed_data --list-dir data/processed/splits --resume outputs/runs/m3_run01/last.pth
 ```
 
 ---
 
-## 📊 Đánh giá & Xuất kết quả NIfTI
+## Đánh giá & Xuất kết quả NIfTI
 
 Đánh giá checkpoint tốt nhất trên tập dữ liệu kiểm thử 3D:
 ```bash
@@ -207,7 +275,7 @@ Protocol `myops380_voxel_v1` tính HD95/ASD trên lưới voxel đơn vị (`vox
 
 ---
 
-## 📂 Cấu trúc Repository (Đã Tinh Gọn)
+## Cấu trúc Repository
 
 ```text
 SCAR/
@@ -241,7 +309,7 @@ SCAR/
 
 ---
 
-## 📚 Tài liệu Tham khảo
+## Tài liệu Tham khảo
 
 1. **SSPANet**: Hasan et al., *Enhancing brain tumor classification with a novel attention based explainable deep learning framework*, Biomedical Signal Processing and Control 112 (2026), 108636.
 2. **I-MMSeg**: Fang et al., *Incorporating modality-specific intensity prior as text prompt for multimodal myocardial pathology segmentation*, Medical Image Analysis 111 (2026), 104072.

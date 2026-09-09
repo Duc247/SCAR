@@ -75,6 +75,8 @@ def flatten_config(config: dict[str, Any], parent_key: str = "", sep: str = ".")
 
 
 MODEL_KEYS = {
+    "model.dpf_bottleneck_width", "model.dpf_skip_width", "model.dpf_loss_version",
+    "model.architecture",
     "model.model_name", "model.num_classes", "model.fused_channels",
     "model.cross_attention_heads", "model.resnet.num_layers", "model.resnet.width_factor",
     "model.decoder_channels", "model.skip_channels", "model.n_skip",
@@ -119,15 +121,26 @@ def coerce_config_to_parser_types(flat_config: dict[str, Any], parser: argparse.
     return defaults
 
 
-def generate_run_dir(run_root: Path | str, model_name: str, timestamp: str | None = None) -> Path:
-    """Generate collision-defended timestamped run directory."""
+def generate_run_dir(
+    run_root: Path | str,
+    model_name: str,
+    seed: int | str | None = None,
+    timestamp: str | None = None,
+) -> Path:
+    """Generate collision-defended timestamped run directory in <model>_seed<seed>_<HHhMM> format."""
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     clean_model_name = str(model_name).replace(" ", "-").replace("/", "-")
     if timestamp is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        timestamp = datetime.now().strftime("%Hh%M")
 
-    base_name = f"{clean_model_name}_{timestamp}"
+    if seed is not None:
+        seed_str = str(seed).strip()
+        seed_part = f"_{seed_str}" if seed_str.lower().startswith("seed") else f"_seed{seed_str}"
+    else:
+        seed_part = ""
+
+    base_name = f"{clean_model_name}{seed_part}_{timestamp}"
     candidate = run_root / base_name
     try:
         candidate.mkdir(parents=True, exist_ok=False)
@@ -149,6 +162,7 @@ def generate_run_dir(run_root: Path | str, model_name: str, timestamp: str | Non
     candidate = run_root / f"{base_name}_{micro}"
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
+
 
 
 def load_merged_config(config_path: str | Path | None = None, base_path: str | Path | None = None) -> dict[str, Any]:

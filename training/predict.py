@@ -62,7 +62,7 @@ def main(argv=None):
     import nibabel as nib
     from ml_collections import ConfigDict
     from preprocessing.preprocessing import MODALITIES, load_aligned_images
-    from training.models.cmspa_net import CMSPANet
+    from training.models import model_from_config
     from training.trainer.trainer import load_checkpoint, resolve_device, resolve_amp, write_json
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -94,7 +94,7 @@ def main(argv=None):
     torch.set_num_threads(args.cpu_threads)
     device = resolve_device(args.device)
     amp = resolve_amp(args.amp, device)
-    model = CMSPANet(ConfigDict(checkpoint["model_config"]), img_size=checkpoint["args"]["img_size"])
+    model = model_from_config(ConfigDict(checkpoint["model_config"]), img_size=checkpoint["args"]["img_size"])
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
     prediction = predict_volume(model, [images[m] for m in MODALITIES],

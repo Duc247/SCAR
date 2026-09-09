@@ -26,6 +26,7 @@ from training.dataset.myops_dataset import (
     ResizeGenerator,
 )
 from training.loss.losses import SegmentationLoss
+from training.loss.dpf_loss import DPFLoss
 from training.metrics.confusion_meter import ConfusionMeter
 from training.dataset.sampler import build_rare_class_sampler
 from training.predict import predict_volume
@@ -161,6 +162,31 @@ def make_logger(directory: Path) -> logging.Logger:
     return logger
 
 
+def append_metrics_csv(path, record):
+    """Expand old CSV schemas on resume; historical new metrics stay blank."""
+    path = Path(path)
+    fields = list(record)
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            old_fields = reader.fieldnames
+            fields = old_fields + [key for key in record if key not in old_fields]
+            if fields != old_fields:
+                temporary = path.with_suffix(".csv.tmp")
+                with temporary.open("w", newline="", encoding="utf-8") as output:
+                    writer = csv.DictWriter(output, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(reader)
+        if fields != old_fields:
+            temporary.replace(path)
+    new = not path.exists() or not path.stat().st_size
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        if new:
+            writer.writeheader()
+        writer.writerow(record)
+
+
 def _configs_equal(c1: Any, c2: Any) -> bool:
     """Recursively compare configurations normalizing sequences (tuples and lists)."""
     if isinstance(c1, dict) and isinstance(c2, dict):
@@ -198,6 +224,7 @@ def run_epoch(
     model.train(training)
     meter = ConfusionMeter(device=device)
     sums = torch.zeros(3, device=device, dtype=torch.float64)
+    extra_sums = {}
     sample_count, skipped_steps, grad_norm_sum, updates, group_samples = 0, 0, 0.0, 0, 0
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -211,11 +238,15 @@ def run_epoch(
             target = batch["label"].to(device, non_blocking=loader.pin_memory)
             batch_count = target.shape[0]
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                logits = model(*images)
-                losses = criterion(logits, target)
-            if not all(torch.isfinite(v) for v in losses.values()):
+                output = model(*images, return_aux=True) if getattr(criterion, "requires_aux", False) else model(*images)
+                losses = criterion(output, target)
+                logits = output["logits"] if isinstance(output, dict) else output
+            if not torch.stack([torch.isfinite(v) for v in losses.values()]).all():
                 raise FloatingPointError(f"Non-finite loss at batch {batch_index}: {batch.get('case_name')}")
             sums += torch.stack([losses[key].detach() for key in ("loss", "ce", "dice_loss")]).double() * batch_count
+            for key, value in losses.items():
+                if key not in ("loss", "ce", "dice_loss"):
+                    extra_sums[key] = extra_sums.get(key, 0) + value.detach().double() * batch_count
             sample_count += batch_count
             meter.update(logits.detach().argmax(1), target)
             if training:
@@ -280,6 +311,7 @@ def run_epoch(
         raise ValueError("Cannot run an epoch with an empty data loader")
     metrics = {key: float(value) / sample_count for key, value in zip(("loss", "ce", "dice_loss"), sums)}
     metrics.update(meter.compute())
+    metrics.update({key: float(value) / sample_count for key, value in extra_sums.items()})
     metrics.update(
         seconds=elapsed,
         samples_per_second=sample_count / elapsed,
@@ -398,7 +430,8 @@ def trainer_Myops(args, model, snapshot_path):
         split_dir, "val_vol", label_order=args.label_order,
     )
     model.to(device)
-    criterion = SegmentationLoss(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
+    loss_class = DPFLoss if model.config.get("architecture") == "m3_dpf" else SegmentationLoss
+    criterion = loss_class(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr, weight_decay=args.weight_decay, foreach=False)
     total_updates = args.max_epochs * math.ceil(len(trainloader) / args.accum_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: max(0.0, 1.0 - step / total_updates) ** 0.9)
@@ -523,6 +556,8 @@ def trainer_Myops(args, model, snapshot_path):
             logger.info("Checkpoint already satisfied early stopping; no additional updates.")
             return {"best_score": best_score, "best_epoch": best_epoch, "global_step": global_step}
         for epoch in range(start_epoch, stop_epoch):
+            if hasattr(criterion, "set_epoch"):
+                criterion.set_epoch(epoch + 1)
             epoch_started = time.perf_counter()
             lr_start = optimizer.param_groups[0]["lr"]
             train_metrics, global_step = run_epoch(
@@ -550,8 +585,10 @@ def trainer_Myops(args, model, snapshot_path):
                 log_every=args.log_every,
                 logger=logger,
             )
+            volume_started = time.perf_counter()
             volume_metrics = validate_volumes(model, validation_volumes, args.img_size,
                                                args.batch_size, device, amp_dtype)
+            volume_seconds = time.perf_counter() - volume_started
             score = volume_metrics["avg_pathology_dice"]
             if score is None:
                 raise ValueError("Pathology selection requires defined validation Dice for both scar and edema")
@@ -575,11 +612,20 @@ def trainer_Myops(args, model, snapshot_path):
                 "bad_epochs": bad_epochs,
                 "early_stop": early_stop,
                 "epoch_compute_seconds": time.perf_counter() - epoch_started,
+                "val/volume_seconds": volume_seconds,
             }
             record.update({f"train/{key}": value for key, value in train_metrics.items()})
             record.update({f"val/{key}": value for key, value in val_metrics.items()})
+            if isinstance(criterion, DPFLoss):
+                record["loss/auxiliary_ramp"] = criterion.ramp
+                record["model/eta_bottleneck"] = float(model.cross_fusion.eta_logit.detach().sigmoid())
+                record["model/eta_skip"] = float(model.feature_fusion[1].eta_logit.detach().sigmoid())
             record["val/avg_pathology_dice"] = score
             for region in ("scar", "edema"):
+                for metric in ("precision", "recall"):
+                    record[f"val/patient_{metric}/{region}"] = volume_metrics[region][f"mean_{metric}"]
+                    for status in ("defined", "undefined"):
+                        record[f"val/{metric}_{status}_cases/{region}"] = volume_metrics[region][f"{metric}_{status}_cases"]
                 record[f"val/patient_dice/{region}"] = volume_metrics[region]["mean_dice"]
                 record[f"val/defined_cases/{region}"] = volume_metrics[region]["dice_defined_cases"]
                 record[f"val/undefined_cases/{region}"] = volume_metrics[region]["dice_undefined_cases"]
@@ -626,12 +672,7 @@ def trainer_Myops(args, model, snapshot_path):
             with (directory / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(json_safe(record), allow_nan=False) + "\n")
             csv_path = directory / "metrics.csv"
-            new_csv = not csv_path.exists() or csv_path.stat().st_size == 0
-            with csv_path.open("a", newline="", encoding="utf-8") as stream:
-                csv_writer = csv.DictWriter(stream, fieldnames=list(record))
-                if new_csv:
-                    csv_writer.writeheader()
-                csv_writer.writerow(json_safe(record))
+            append_metrics_csv(csv_path, json_safe(record))
             if writer:
                 for key, value in record.items():
                     if isinstance(value, (float, int)) and math.isfinite(value):
@@ -650,6 +691,9 @@ def trainer_Myops(args, model, snapshot_path):
                 train_metrics["gpu_peak_allocated_mb"],
             )
             write_json(directory / "summary.json", record)
+            logger.info("Validation scar P/R %.4f/%.4f | edema P/R %.4f/%.4f (pixel-pooled)",
+                        val_metrics["precision/scar"], val_metrics["recall/scar"],
+                        val_metrics["precision/edema"], val_metrics["recall/edema"])
             if early_stop:
                 logger.info("Early stopping after %d validation epochs without sufficient improvement.", bad_epochs)
                 break
