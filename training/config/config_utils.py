@@ -44,6 +44,7 @@ YAML_KEY_TO_DEST: dict[str, str] = {
     "model.gradient_checkpointing": "gradient_checkpointing",
     "outputs.dir": "output_dir",
     "outputs.output_dir": "output_dir",
+    "outputs.backup_dir": "backup_dir",
     "outputs.run_root": "run_root",
     "outputs.run_id": "run_id",
     "seed": "seed",
@@ -100,7 +101,7 @@ def coerce_config_to_parser_types(flat_config: dict[str, Any], parser: argparse.
         dest = YAML_KEY_TO_DEST[key]
         action = actions[dest]
         if value is None:
-            if dest not in {"resume", "pretrained", "pin_memory", "output_dir", "run_id"}:
+            if dest not in {"resume", "pretrained", "pin_memory", "output_dir", "run_id", "backup_dir"}:
                 raise ValueError(f"{key} cannot be null")
             defaults[dest] = None
             continue

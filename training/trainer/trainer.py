@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import sys
 import time
 from typing import Any
@@ -113,7 +114,28 @@ def atomic_checkpoint(path: Path | str, payload: dict[str, Any]):
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
-    os.replace(temporary, path)
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        shutil.move(str(temporary), str(path))
+
+
+def sync_to_backup(directory: Path, backup_dir: Path | str | None, filenames: tuple[str, ...] | list[str] = ()):
+    """Continuously mirror checkpoints, metrics, and logs to a backup directory (e.g. Google Drive)."""
+    if not backup_dir:
+        return
+    backup_path = Path(backup_dir)
+    try:
+        backup_path.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            src = directory / name
+            dest = backup_path / name
+            if src.is_file():
+                shutil.copy2(src, dest)
+            elif src.is_dir():
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+    except Exception as exc:
+        logging.getLogger("scar.train").warning("Backup sync to %s failed: %s", backup_dir, exc)
 
 
 def load_checkpoint(path: Path | str) -> dict[str, Any]:
@@ -535,6 +557,7 @@ def trainer_Myops(args, model, snapshot_path):
         total_optimizer_updates=total_updates,
     )
     write_json(directory / "config.json", config_record)
+    sync_to_backup(directory, getattr(args, "backup_dir", None), ["config.json", "splits"])
     logger.info(
         "Device %s | AMP %s | parameters %s | train/val slices %d/%d | effective batch <= %d",
         device,
@@ -708,6 +731,12 @@ def trainer_Myops(args, model, snapshot_path):
             logger.info("Validation scar P/R %.4f/%.4f | edema P/R %.4f/%.4f (pixel-pooled)",
                         val_metrics["precision/scar"], val_metrics["recall/scar"],
                         val_metrics["precision/edema"], val_metrics["recall/edema"])
+            sync_files = ["summary.json", "metrics.csv", "metrics.jsonl", "train.log"]
+            if improved:
+                sync_files.append("best.pth")
+            if (epoch + 1) % 5 == 0 or (epoch + 1) == stop_epoch or early_stop:
+                sync_files.append("last.pth")
+            sync_to_backup(directory, getattr(args, "backup_dir", None), sync_files)
             if early_stop:
                 logger.info("Early stopping after %d validation epochs without sufficient improvement.", bad_epochs)
                 break
@@ -715,6 +744,11 @@ def trainer_Myops(args, model, snapshot_path):
         logger.exception("Training interrupted/failed; last.pth contains the last completed epoch if available.")
         raise
     finally:
+        sync_to_backup(
+            directory,
+            getattr(args, "backup_dir", None),
+            ["last.pth", "best.pth", "summary.json", "metrics.csv", "metrics.jsonl", "train.log"],
+        )
         if writer:
             writer.close()
         if step_writer:

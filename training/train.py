@@ -55,6 +55,11 @@ def build_parser():
         help="Output directory; defaults to outputs/runs/{model_name}_seed{seed}_{HHhMM}",
     )
     parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="Optional Google Drive backup directory to continuously mirror checkpoints and metrics",
+    )
+    parser.add_argument(
         "--run-root",
         default=str(PROJECT_ROOT / "outputs" / "runs"),
         help="Root directory for automated timestamped runs",
