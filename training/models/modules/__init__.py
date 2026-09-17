@@ -21,6 +21,13 @@ from training.models.modules.sspanet import (
     strip_rms,
 )
 
+from training.models.modules.dcmfe import (
+    CMFE_Fusion,
+    DCMFE_Fusion,
+    DeformableCrossModalFusion,
+)
+from training.models.modules.dpf import DualPathologyFusion
+
 __all__ = [
     "CMSPA_Fusion",
     "channel_std",
@@ -38,4 +45,9 @@ __all__ = [
     "SSPANet_Block",
     "_statistics_input",
     "strip_rms",
+    "DeformableCrossModalFusion",
+    "DCMFE_Fusion",
+    "CMFE_Fusion",
+    "DualPathologyFusion",
 ]
+

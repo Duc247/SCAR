@@ -23,6 +23,7 @@ from training.models.modules.decoder import DecoderCup, SegmentationHead
 from training.models.modules.fusion import ConcatFusion, CrossAttention_Fusion, Fusion_Embed
 from training.models.modules.sspanet import SSPANet_Block
 from training.models.m3_dpf import M3DPF
+from training.models.baseline_dcmfe import BaselineCMFE, BaselineDCMFE
 
 MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
     "m3_dpf": M3DPF,
@@ -32,7 +33,13 @@ MODEL_REGISTRY: dict[str, Callable[..., nn.Module]] = {
     "concat_baseline": partial(CMSPANet, ablation="M0"),
     "sspanet_baseline": partial(CMSPANet, ablation="M1"),
     "cross_attn_baseline": partial(CMSPANet, ablation="M2"),
+    "baseline_dcmfe": BaselineDCMFE,
+    "d_cmfe": BaselineDCMFE,
+    "dcmfe_baseline": BaselineDCMFE,
+    "baseline_cmfe": BaselineCMFE,
+    "cmfe_baseline": BaselineCMFE,
 }
+
 
 
 def model_from_config(config, **kwargs):
@@ -56,6 +63,8 @@ def build_model(model_name: str, **kwargs) -> nn.Module:
 
 
 __all__ = [
+    "BaselineDCMFE",
+    "BaselineCMFE",
     "M3DPF",
     "model_from_config",
     "CMSPANet",

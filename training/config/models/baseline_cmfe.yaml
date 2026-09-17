@@ -1,0 +1,7 @@
+model:
+  model_name: Baseline-CMFE
+  architecture: baseline_cmfe
+  ablation: M0
+  use_sspanet: false
+loss:
+  loss_type: ce_dice

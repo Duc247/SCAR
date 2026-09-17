@@ -62,7 +62,16 @@ def build_parser():
     parser.add_argument("--run-id", default=None, help="Named run directory under --run-root")
     parser.add_argument("--ce-weight", type=float, default=0.5)
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--loss-type",
+        choices=["default", "ce_dice", "anatomical", "clinical_anatomical"],
+        default="default",
+        help="Loss function type: default (CE+Dice) or anatomical (Hướng 1)",
+    )
+    parser.add_argument("--loss-alpha", "--alpha", dest="alpha", type=float, default=0.1, help="Alpha weight for scar-in-edema constraint")
+    parser.add_argument("--loss-beta", "--beta", dest="beta", type=float, default=0.05, help="Beta weight for lesion leakage constraint")
     parser.add_argument("--sampler", choices=("none", "rare"), default="none")
+
     parser.add_argument("--rare-boost", type=float, default=2.0)
     parser.add_argument("--foreground-boost", type=float, default=1.3)
     parser.add_argument("--ablation", choices=["M0", "M1", "M2", "M3"], default="M3")
@@ -207,14 +216,25 @@ def main(argv=None):
     config.resnet.width_factor = float(section["resnet"]["width_factor"])
     config.transformer.dropout_rate = float(section.get("transformer", {}).get("dropout_rate", 0.1))
     for key in ("decoder_channels", "skip_channels", "fused_channels", "n_skip", "cross_attention_heads", "classifier", "activation",
-                "dpf_bottleneck_width", "dpf_skip_width", "dpf_loss_version"):
+                "dpf_bottleneck_width", "dpf_skip_width", "dpf_loss_version", "max_offset", "use_sspanet"):
         if key in section:
             config[key] = tuple(section[key]) if key == "decoder_channels" else section[key]
+    if "loss" in merged:
+        for key in ("loss_type", "alpha", "beta"):
+            if key in merged["loss"]:
+                config[key] = merged["loss"][key]
+    if getattr(args, "loss_type", "default") != "default":
+        config["loss_type"] = args.loss_type
+    if hasattr(args, "alpha"):
+        config["alpha"] = args.alpha
+    if hasattr(args, "beta"):
+        config["beta"] = args.beta
     config.ablation = args.ablation
     config.gradient_checkpointing = args.gradient_checkpointing
     config.n_classes = 4
     if "architecture" in section:
         config.architecture = section["architecture"]
+
     torch.set_num_threads(args.cpu_threads)
     seed_everything(args.seed, args.deterministic)
     model = model_from_config(config, img_size=args.img_size, num_classes=4, ablation=args.ablation)

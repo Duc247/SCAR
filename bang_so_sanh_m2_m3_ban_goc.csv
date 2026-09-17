@@ -1,0 +1,5 @@
+﻿Model,Scar_Dice(%),Scar_HD95(voxel),Edema_Dice(%),Edema_HD95(voxel),Myocardium_Dice(%),Myocardium_HD95(voxel),Avg_Pathology_Dice(%),Avg_Pathology_HD95(voxel)
+Bản gốc (Baseline),71.84,4.43,73.53,4.38,86.94,1.10,72.69,4.41
+Bản gốc (I-MMSeg SOTA),73.64,3.66,75.44,3.89,87.41,1.07,74.54,3.78
+M2 (Cải tiến - Cross-Attn),40.85,9.62,73.18,4.10,87.48,1.06,57.01,6.86
+M3 (Cải tiến - CMSPA),42.90,8.27,73.24,4.31,87.57,1.06,58.07,6.29

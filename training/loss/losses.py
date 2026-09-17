@@ -63,3 +63,10 @@ class SegmentationLoss(nn.Module):
             "ce": ce,
             "dice_loss": dice,
         }
+
+
+from training.loss.anatomical_loss import (
+    AnatomicalSegmentationLoss,
+    ClinicalAnatomicalInclusionLoss,
+)
+

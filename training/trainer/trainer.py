@@ -27,6 +27,7 @@ from training.dataset.myops_dataset import (
 )
 from training.loss.losses import SegmentationLoss
 from training.loss.dpf_loss import DPFLoss
+from training.loss.anatomical_loss import AnatomicalSegmentationLoss
 from training.metrics.confusion_meter import ConfusionMeter
 from training.dataset.sampler import build_rare_class_sampler
 from training.predict import predict_volume
@@ -430,9 +431,22 @@ def trainer_Myops(args, model, snapshot_path):
         split_dir, "val_vol", label_order=args.label_order,
     )
     model.to(device)
-    loss_class = DPFLoss if model.config.get("architecture") == "m3_dpf" else SegmentationLoss
-    criterion = loss_class(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
+    loss_type = getattr(args, "loss_type", None) or model.config.get("loss_type", "default")
+    if model.config.get("architecture") == "m3_dpf":
+        criterion = DPFLoss(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
+    elif str(loss_type).lower() in ("anatomical", "clinical_anatomical", "inclusion", "anatomical_ce_dice"):
+        criterion = AnatomicalSegmentationLoss(
+            n_classes=4,
+            ce_weight=args.ce_weight,
+            dice_weight=args.dice_weight,
+            alpha=getattr(args, "alpha", model.config.get("alpha", 0.1)),
+            beta=getattr(args, "beta", model.config.get("beta", 0.05)),
+            label_order=args.label_order,
+        )
+    else:
+        criterion = SegmentationLoss(ce_weight=args.ce_weight, dice_weight=args.dice_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr, weight_decay=args.weight_decay, foreach=False)
+
     total_updates = args.max_epochs * math.ceil(len(trainloader) / args.accum_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: max(0.0, 1.0 - step / total_updates) ** 0.9)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)

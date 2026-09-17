@@ -1,0 +1,10 @@
+model:
+  model_name: Baseline-DCMFE
+  architecture: baseline_dcmfe
+  ablation: M0
+  max_offset: 2.0
+  use_sspanet: false
+loss:
+  loss_type: anatomical
+  alpha: 0.1
+  beta: 0.05

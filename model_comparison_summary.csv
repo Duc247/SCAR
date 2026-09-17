@@ -1,0 +1,10 @@
+﻿Model,Type,Scar_Dice(%),Scar_HD95(voxel),Edema_Dice(%),Edema_HD95(voxel),Myocardium_Dice(%),Myocardium_HD95(voxel),Avg_Pathology_Dice(%),Avg_Pathology_HD95(voxel)
+nnU-Net (Paper Table 1),Paper Prior SOTA,71.21,4.68,73.07,5.12,86.23,1.11,72.14,4.9
+MyoPS-Net (Paper Table 1),Paper Prior SOTA,69.55,5.63,72.14,5.39,83.97,1.2,70.85,5.51
+TransUNet (Paper Table 1),Paper Baseline,63.9,6.45,71.12,5.46,83.67,1.2,67.51,5.96
+Paper Baseline (Table 3),Paper Vision Baseline,71.84,4.43,73.53,4.38,86.94,1.1,72.69,4.41
+I-MMSeg (Paper Table 1 & 3),Paper Proposed (Text Prior),73.64,3.66,75.44,3.89,87.41,1.07,74.54,3.78
+M2 (SCAR - Cross-Attn) [Official Protocol],Ablation M2,40.85,9.62,73.18,4.1,87.48,1.06,57.01,6.86
+M3 (SCAR - CMSPA) [Official Protocol],Proposed M3,42.9,8.27,73.24,4.31,87.57,1.06,58.07,6.29
+M2 (SCAR - Cross-Attn) [Primary Protocol],Ablation M2,40.85,9.62,72.82,4.16,87.48,1.06,56.84,6.89
+M3 (SCAR - CMSPA) [Primary Protocol],Proposed M3,42.9,8.27,71.92,4.37,87.57,1.06,57.41,6.32

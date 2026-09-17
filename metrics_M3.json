@@ -1,0 +1,230 @@
+{
+  "normal_myocardium": {
+    "cases": 76,
+    "status_counts": {
+      "ok": 76
+    },
+    "mean_dice": 0.7786781738961013,
+    "dice_defined_cases": 76,
+    "dice_undefined_cases": 0,
+    "mean_iou": 0.6438658588599532,
+    "iou_defined_cases": 76,
+    "iou_undefined_cases": 0,
+    "mean_precision": 0.7932754971068702,
+    "precision_defined_cases": 76,
+    "precision_undefined_cases": 0,
+    "mean_recall": 0.7745869667705751,
+    "recall_defined_cases": 76,
+    "recall_undefined_cases": 0,
+    "mean_hd95_voxel": 2.4663828765400932,
+    "hd95_voxel_defined_cases": 76,
+    "hd95_voxel_undefined_cases": 0,
+    "mean_asd_voxel": 0.5118901951382488,
+    "asd_voxel_defined_cases": 76,
+    "asd_voxel_undefined_cases": 0,
+    "mean_official_dice": 0.7786781738961013,
+    "official_dice_defined_cases": 76,
+    "official_dice_undefined_cases": 0,
+    "mean_official_hd95_voxel": 2.4663828765400932,
+    "official_hd95_voxel_defined_cases": 76,
+    "official_hd95_voxel_undefined_cases": 0
+  },
+  "edema": {
+    "cases": 76,
+    "status_counts": {
+      "ok": 75,
+      "target_empty": 1
+    },
+    "mean_dice": 0.7192057633754213,
+    "dice_defined_cases": 76,
+    "dice_undefined_cases": 0,
+    "mean_iou": 0.5788089635623631,
+    "iou_defined_cases": 76,
+    "iou_undefined_cases": 0,
+    "mean_precision": 0.7278886039311449,
+    "precision_defined_cases": 76,
+    "precision_undefined_cases": 0,
+    "mean_recall": 0.7444171394428414,
+    "recall_defined_cases": 75,
+    "recall_undefined_cases": 1,
+    "mean_hd95_voxel": 4.366079731593925,
+    "hd95_voxel_defined_cases": 75,
+    "hd95_voxel_undefined_cases": 1,
+    "mean_asd_voxel": 0.8931093694510681,
+    "asd_voxel_defined_cases": 75,
+    "asd_voxel_undefined_cases": 1,
+    "mean_official_dice": 0.7323636581122634,
+    "official_dice_defined_cases": 76,
+    "official_dice_undefined_cases": 0,
+    "mean_official_hd95_voxel": 4.308631314072953,
+    "official_hd95_voxel_defined_cases": 76,
+    "official_hd95_voxel_undefined_cases": 0
+  },
+  "scar": {
+    "cases": 76,
+    "status_counts": {
+      "ok": 76
+    },
+    "mean_dice": 0.4289726435061209,
+    "dice_defined_cases": 76,
+    "dice_undefined_cases": 0,
+    "mean_iou": 0.2851342401398108,
+    "iou_defined_cases": 76,
+    "iou_undefined_cases": 0,
+    "mean_precision": 0.4235612825471989,
+    "precision_defined_cases": 76,
+    "precision_undefined_cases": 0,
+    "mean_recall": 0.4988731680353715,
+    "recall_defined_cases": 76,
+    "recall_undefined_cases": 0,
+    "mean_hd95_voxel": 8.273867807885392,
+    "hd95_voxel_defined_cases": 76,
+    "hd95_voxel_undefined_cases": 0,
+    "mean_asd_voxel": 2.5332577744235127,
+    "asd_voxel_defined_cases": 76,
+    "asd_voxel_undefined_cases": 0,
+    "mean_official_dice": 0.4289726435061209,
+    "official_dice_defined_cases": 76,
+    "official_dice_undefined_cases": 0,
+    "mean_official_hd95_voxel": 8.273867807885392,
+    "official_hd95_voxel_defined_cases": 76,
+    "official_hd95_voxel_undefined_cases": 0
+  },
+  "edema_inclusive": {
+    "cases": 76,
+    "status_counts": {
+      "ok": 76
+    },
+    "mean_dice": 0.746735457707638,
+    "dice_defined_cases": 76,
+    "dice_undefined_cases": 0,
+    "mean_iou": 0.6083339535923349,
+    "iou_defined_cases": 76,
+    "iou_undefined_cases": 0,
+    "mean_precision": 0.7297379734620562,
+    "precision_defined_cases": 76,
+    "precision_undefined_cases": 0,
+    "mean_recall": 0.7936866951918639,
+    "recall_defined_cases": 76,
+    "recall_undefined_cases": 0,
+    "mean_hd95_voxel": 4.604359536429594,
+    "hd95_voxel_defined_cases": 76,
+    "hd95_voxel_undefined_cases": 0,
+    "mean_asd_voxel": 0.9797060231140676,
+    "asd_voxel_defined_cases": 76,
+    "asd_voxel_undefined_cases": 0,
+    "mean_official_dice": 0.746735457707638,
+    "official_dice_defined_cases": 76,
+    "official_dice_undefined_cases": 0,
+    "mean_official_hd95_voxel": 4.604359536429594,
+    "official_hd95_voxel_defined_cases": 76,
+    "official_hd95_voxel_undefined_cases": 0
+  },
+  "myocardial_ring": {
+    "cases": 76,
+    "status_counts": {
+      "ok": 76
+    },
+    "mean_dice": 0.8757402201026973,
+    "dice_defined_cases": 76,
+    "dice_undefined_cases": 0,
+    "mean_iou": 0.7801410054250628,
+    "iou_defined_cases": 76,
+    "iou_undefined_cases": 0,
+    "mean_precision": 0.867348800042197,
+    "precision_defined_cases": 76,
+    "precision_undefined_cases": 0,
+    "mean_recall": 0.8871774484736866,
+    "recall_defined_cases": 76,
+    "recall_undefined_cases": 0,
+    "mean_hd95_voxel": 1.0567593223550626,
+    "hd95_voxel_defined_cases": 76,
+    "hd95_voxel_undefined_cases": 0,
+    "mean_asd_voxel": 0.23370596287469383,
+    "asd_voxel_defined_cases": 76,
+    "asd_voxel_undefined_cases": 0,
+    "mean_official_dice": 0.8757402201026973,
+    "official_dice_defined_cases": 76,
+    "official_dice_undefined_cases": 0,
+    "mean_official_hd95_voxel": 1.0567593223550626,
+    "official_hd95_voxel_defined_cases": 76,
+    "official_hd95_voxel_undefined_cases": 0
+  },
+  "avg_pathology_dice": 0.5740892034407711,
+  "avg_pathology_iou": 0.43197160185108696,
+  "official_avg_pathology_dice": 0.5806681508091922,
+  "avg_pathology_hd95_voxel": 6.319973769739658,
+  "official_avg_pathology_hd95_voxel": 6.291249560979172,
+  "checkpoint": "/content/best.pth",
+  "checkpoint_epoch": 65,
+  "ablation": "M3",
+  "architecture": "cmspa_net",
+  "split": "test_vol",
+  "case_count": 76,
+  "inference_seconds": 13.576614834000338,
+  "inference_slices_per_second": 34.397381505622256,
+  "timing_note": "Includes transfer and resizing, excludes disk I/O/metrics; first case includes warmup.",
+  "benchmark_protocol": {
+    "id": "myops380_voxel_v1",
+    "distance_unit": "voxel",
+    "voxelspacing": null,
+    "axis_order": "HWD",
+    "regions": {
+      "normal_myocardium": [
+        1
+      ],
+      "edema": [
+        2
+      ],
+      "scar": [
+        3
+      ],
+      "edema_inclusive": [
+        2,
+        3
+      ],
+      "myocardial_ring": [
+        1,
+        2,
+        3
+      ]
+    },
+    "primary_empty_policy": "both_empty: excluded; one_empty: Dice/IoU=0, distances undefined",
+    "aggregation": "equal patient weight within each region; exclude undefined values and report counts",
+    "selection_metric": "avg_pathology_dice",
+    "pathology_regions": [
+      "scar",
+      "edema"
+    ],
+    "pathology_aggregation": "arithmetic mean of scar and exclusive-edema patient means; both required",
+    "official_reference": "I_MMSeg@90f46c4eb72924509895fcda6bc6a3b8c3316e66/utils.py:171-182",
+    "official_empty_policy": "if either empty: Dice=1 when pred<200 and target<=200, else 0; HD95=0"
+  },
+  "benchmark_data": {
+    "schema_version": 1,
+    "source_label_order": "background_normal_edema_scar",
+    "canonical_class_names": [
+      "background",
+      "normal_myocardium",
+      "edema",
+      "scar"
+    ],
+    "cache_sha256": "f4c9885d3f6ede61f2bda5012913e554b8035a6857480b10180a316bc57582f4",
+    "cache_files": 6144,
+    "official_test_ids_sha256": "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc",
+    "patient_counts": {
+      "train": 243,
+      "val": 61,
+      "test_vol": 76
+    }
+  },
+  "split_hashes": {
+    "train": "a23ad501873aad4bf290b37de46fec6849ef627b02f69c15ac2942b0e7c1a013",
+    "val": "a56e70bd69d5764f9f1f9f5cc50798bf0ec4ae5116d6700a5df654841d6271fd",
+    "val_vol": "513c714edc61682829103897100e8cec1b57200608e3cb2ed63a7787be7b2737",
+    "test_vol": "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc"
+  },
+  "hd95_note": "All distances are voxel distances (unit grid), never mm. Primary means exclude undefined surfaces; inspect counts. Official reproduction is separately named and retains the upstream empty-mask behavior.",
+  "device": "cuda",
+  "amp_dtype": "torch.bfloat16"
+}
