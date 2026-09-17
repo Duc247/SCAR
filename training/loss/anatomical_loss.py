@@ -95,18 +95,22 @@ class ClinicalAnatomicalInclusionLoss(nn.Module):
         y_edema = (target == self.edema_idx).float()
 
         # 1. Ràng buộc Scar nằm trong Edema (L_se)
-        non_edema = 1.0 - y_edema
-        denom_non_edema = torch.sum(non_edema) + self.eps
-        # Phạt nếu Scar dự đoán tràn vào vùng non-edema
+        # Trong MyoPS, tổn thương thực tế (Area at Risk) bao gồm cả Edema (2) và Scar (3)
+        y_lesion = torch.clamp(y_edema + y_scar, 0.0, 1.0)
+        non_lesion = 1.0 - y_lesion
+        denom_non_lesion = torch.sum(non_lesion) + self.eps
+
+        # Phạt nếu Scar dự đoán rò rỉ ra ngoài vùng tổn thương (vào cơ tim lành hoặc ngoài tim)
         loss_scar_out = -torch.sum(
-            non_edema * torch.log(torch.clamp(1.0 - p_scar, min=self.eps, max=1.0))
-        ) / denom_non_edema
+            non_lesion * torch.log(torch.clamp(1.0 - p_scar, min=self.eps, max=1.0))
+        ) / denom_non_lesion
 
         num_scar = torch.sum(y_scar)
+        p_lesion = torch.clamp(p_scar + p_edema, 0.0, 1.0)
         if num_scar > 0:
-            # Bắt buộc Edema dự đoán phải bao bọc các pixel Scar chuẩn
+            # Bắt buộc vùng tổn thương dự đoán (Edema + Scar) phải bao bọc các pixel Scar chuẩn
             loss_edema_cov = -torch.sum(
-                y_scar * torch.log(torch.clamp(p_edema, min=self.eps, max=1.0))
+                y_scar * torch.log(torch.clamp(p_lesion, min=self.eps, max=1.0))
             ) / (num_scar + self.eps)
         else:
             loss_edema_cov = torch.tensor(0.0, device=pred_logits.device, dtype=torch.float32)
@@ -114,9 +118,8 @@ class ClinicalAnatomicalInclusionLoss(nn.Module):
         l_se = loss_scar_out + loss_edema_cov
 
         # 2. Ràng buộc Tổn thương không rò rỉ ra ngoài cơ tim (L_leak)
-        y_myo_total = torch.clamp(y_myo + y_scar + y_edema, 0.0, 1.0)
+        y_myo_total = torch.clamp(y_myo + y_lesion, 0.0, 1.0)
         outside_heart = 1.0 - y_myo_total
-        p_lesion = torch.clamp(p_scar + p_edema, 0.0, 1.0)
         denom_outside = torch.sum(outside_heart) + self.eps
         l_leak = -torch.sum(
             outside_heart * torch.log(torch.clamp(1.0 - p_lesion, min=self.eps, max=1.0))

@@ -74,6 +74,21 @@ class TestClinicalAnatomicalInclusionLoss(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["loss_inc"]))
         self.assertEqual(float(out["loss_edema_cov"]), 0.0)
 
+    def test_perfect_prediction_does_not_penalize_scar(self):
+        loss_fn = ClinicalAnatomicalInclusionLoss(label_order="canonical")
+        # Target with bg(0), myo(1), edema(2), scar(3)
+        target = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.long)
+        logits = torch.zeros(1, 4, 1, 4)
+        logits[0, 0, 0, 0] = 10.0
+        logits[0, 1, 0, 1] = 10.0
+        logits[0, 2, 0, 2] = 10.0
+        logits[0, 3, 0, 3] = 10.0
+        out = loss_fn(logits, target)
+        # Perfectly predicting scar on scar must not incur large penalty
+        self.assertLess(float(out["loss_scar_out"]), 1e-3)
+        self.assertLess(float(out["loss_edema_cov"]), 1e-3)
+        self.assertLess(float(out["loss_inc"]), 1e-3)
+
     def test_anatomical_segmentation_compound_loss(self):
         compound = AnatomicalSegmentationLoss(n_classes=4, alpha=0.1, beta=0.05, label_order="canonical")
         pred_logits = torch.randn(2, 4, 16, 16, requires_grad=True)
