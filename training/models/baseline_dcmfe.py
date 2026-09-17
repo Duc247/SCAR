@@ -11,8 +11,45 @@ from __future__ import annotations
 from torch import nn
 
 from training.models.cmspa_net import CMSPANet
-from training.models.modules.dcmfe import CMFE_Fusion, DCMFE_Fusion
+from training.models.modules.dcmfe import CMFE_Fusion, DCMFE_Fusion, DCMSPA_Fusion
 from training.models.modules.sspanet import SSPANet_Block
+
+
+class DCMSPANet(CMSPANet):
+    """Ultimate Proposed Architecture: D-CMSPA-Net (Full 4-Way Union).
+
+    Combines:
+    - Hướng 1: Clinical Anatomical Inclusion Loss (supervised during training)
+    - Hướng 2: SSPANet RMS Strip Pooling Attention on all 3 encoder branches
+    - Hướng 3 + 4: D-CMSPA (Deformable Cross-Modal Strip Pathology Attention)
+      which first eliminates respiratory motion displacement via learned 2D deformable
+      sampling, then applies CINE strip anatomy gating and contrast pathology feedback.
+    - 3-level skip feature fusion
+    - TransUNet-style decoder cascade
+    """
+
+    def __init__(self, config=None, max_offset: float = 2.0, **kwargs):
+        kwargs.setdefault("ablation", "M3")
+        super().__init__(config, **kwargs)
+
+        self.config.architecture = "dcmspa_net"
+        self.config.max_offset = float(self.config.get("max_offset", max_offset))
+        self.config.use_sspanet = True
+
+        width = int(64 * self.config.resnet.width_factor)
+        channels = 16 * width
+
+        # Hướng 2: SSPANet on all 3 encoders
+        self.sspanet_cine = SSPANet_Block(channels)
+        self.sspanet_psir = SSPANet_Block(channels)
+        self.sspanet_t2w = SSPANet_Block(channels)
+
+        # Hướng 4 + Hướng 3: Deformable Cross-Modal Strip Pathology Attention
+        self.cross_fusion = DCMSPA_Fusion(
+            in_channels=channels,
+            out_channels=self.config.fused_channels,
+            max_offset=self.config.max_offset,
+        )
 
 
 class BaselineDCMFE(CMSPANet):
@@ -80,3 +117,4 @@ class BaselineCMFE(CMSPANet):
             in_channels=channels,
             out_channels=self.config.fused_channels,
         )
+

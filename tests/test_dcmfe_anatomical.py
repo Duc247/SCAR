@@ -14,11 +14,12 @@ from training.loss.anatomical_loss import (
 )
 from training.loss.losses import SegmentationLoss
 from training.models import build_model, model_from_config
-from training.models.baseline_dcmfe import BaselineCMFE, BaselineDCMFE
+from training.models.baseline_dcmfe import BaselineCMFE, BaselineDCMFE, DCMSPANet
 from training.models.cmspa_net import get_testing
 from training.models.modules.dcmfe import (
     CMFE_Fusion,
     DCMFE_Fusion,
+    DCMSPA_Fusion,
     DeformableCrossModalFusion,
 )
 from training.trainer.trainer import run_epoch
@@ -161,6 +162,22 @@ class TestDCMFEModules(unittest.TestCase):
         out.sum().backward()
         self.assertTrue(torch.isfinite(cine.grad).all())
 
+    def test_dcmspa_fusion_3modalities(self):
+        in_channels, out_channels = 64, 32
+        fusion = DCMSPA_Fusion(in_channels=in_channels, out_channels=out_channels, max_offset=2.0)
+        cine = torch.randn(2, in_channels, 16, 16, requires_grad=True)
+        psir = torch.randn(2, in_channels, 16, 16, requires_grad=True)
+        t2w = torch.randn(2, in_channels, 16, 16, requires_grad=True)
+
+        out = fusion(cine, psir, t2w)
+        self.assertEqual(out.shape, (2, out_channels, 16, 16))
+
+        out.sum().backward()
+        for t in (cine, psir, t2w):
+            self.assertIsNotNone(t.grad)
+            self.assertTrue(torch.isfinite(t.grad).all())
+
+
 
 class TestBaselineDCMFEModel(unittest.TestCase):
     def setUp(self):
@@ -213,6 +230,46 @@ class TestBaselineDCMFEModel(unittest.TestCase):
         images = [torch.randn(2, 1, 32, 32) for _ in range(3)]
         logits = model(*images)
         self.assertEqual(logits.shape, (2, 4, 32, 32))
+
+    def test_dcmspa_net_forward_and_checkpoint(self):
+        config = get_testing()
+        config.architecture = "dcmspa_net"
+        config.max_offset = 2.0
+        config.use_sspanet = True
+
+        model = build_model("dcmspa_net", config=config, img_size=32)
+        self.assertIsInstance(model, DCMSPANet)
+        self.assertIsInstance(model.cross_fusion, DCMSPA_Fusion)
+
+        images = [torch.randn(2, 1, 32, 32) for _ in range(3)]
+        target = torch.randint(0, 4, (2, 32, 32))
+
+        logits = model(*images)
+        self.assertEqual(logits.shape, (2, 4, 32, 32))
+
+        criterion = AnatomicalSegmentationLoss(n_classes=4, alpha=0.1, beta=0.05)
+        loss_dict = criterion(logits, target)
+        self.assertTrue(torch.isfinite(loss_dict["loss"]))
+        loss_dict["loss"].backward()
+
+        # Check gradients propagate through D-CMSPA and SSPANet
+        for param in model.cross_fusion.parameters():
+            if param.requires_grad:
+                self.assertIsNotNone(param.grad)
+                self.assertTrue(torch.isfinite(param.grad).all())
+
+        # Check save and load roundtrip
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "dcmspa_test.pth"
+            torch.save({"model": model.state_dict(), "model_config": model.config.to_dict()}, ckpt_path)
+            loaded = torch.load(ckpt_path, weights_only=True)
+            clone = model_from_config(ConfigDict(loaded["model_config"]), img_size=32)
+            clone.load_state_dict(loaded["model"], strict=True)
+            clone.eval()
+            model.eval()
+            with torch.no_grad():
+                torch.testing.assert_close(model(*images), clone(*images))
+
 
     def test_trainer_run_epoch_step_with_dcmfe_and_anatomical(self):
         config = get_testing()

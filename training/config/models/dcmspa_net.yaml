@@ -1,0 +1,10 @@
+model:
+  model_name: D-CMSPA-Net
+  architecture: dcmspa_net
+  ablation: M3
+  max_offset: 2.0
+  use_sspanet: true
+loss:
+  loss_type: anatomical
+  alpha: 0.1
+  beta: 0.05
