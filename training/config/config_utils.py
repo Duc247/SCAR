@@ -30,6 +30,9 @@ YAML_KEY_TO_DEST: dict[str, str] = {
     "train.pretrained": "pretrained",
     "loss.ce_weight": "ce_weight",
     "loss.dice_weight": "dice_weight",
+    "loss.loss_type": "loss_type",
+    "loss.alpha": "alpha",
+    "loss.beta": "beta",
     "data.data_root": "data_root",
     "data.list_dir": "list_dir",
     "data.val_fraction": "val_fraction",
@@ -81,6 +84,7 @@ MODEL_KEYS = {
     "model.cross_attention_heads", "model.resnet.num_layers", "model.resnet.width_factor",
     "model.decoder_channels", "model.skip_channels", "model.n_skip",
     "model.activation", "model.classifier", "model.transformer.dropout_rate",
+    "model.max_offset", "model.use_sspanet",
 }
 
 
